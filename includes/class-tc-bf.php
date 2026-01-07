@@ -13,6 +13,7 @@ final class Plugin {
 	const GF_FIELD_EVENT_ID      = 20;
 	const GF_FIELD_EVENT_TITLE   = 1;
 	const GF_FIELD_TOTAL         = 76;
+	const GF_FIELD_SUBTOTAL      = 173; // undiscounted subtotal (part + rental)
 	const GF_FIELD_START_RAW     = 132;
 	const GF_FIELD_END_RAW       = 134;
 
@@ -795,7 +796,17 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Authoritative base price comes from event meta.
 		// IMPORTANT: GF field TOTAL (76) represents the client-facing total, which may include rental.
 		$part_price   = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
-		$client_total = isset($_POST['input_' . self::GF_FIELD_TOTAL]) ? (float) $_POST['input_' . self::GF_FIELD_TOTAL] : 0.0;
+
+// IMPORTANT:
+// - Field 76 (GF "Total") can become discounted if you show EB/partner totals in the form.
+// - For validation we must compare against the *undiscounted* subtotal.
+//   We use field 173 ("S") if present; otherwise we fall back to field 76.
+$posted_subtotal = 0.0;
+if ( isset($_POST['input_' . self::GF_FIELD_SUBTOTAL]) ) {
+	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_SUBTOTAL];
+} elseif ( isset($_POST['input_' . $subtotal_field_id]) ) {
+	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_TOTAL];
+}
 
 		if ( $part_price > 0 ) {
 
@@ -828,16 +839,22 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 
 			$expected_total = $part_price + $rental_price;
 
-			if ( $client_total > 0 ) {
+			$subtotal_field_id = isset($_POST['input_' . self::GF_FIELD_SUBTOTAL]) ? self::GF_FIELD_SUBTOTAL : self::GF_FIELD_TOTAL;
+
+			if ( $posted_subtotal > 0 ) {
 				// Drift/tamper check (2 cents tolerance)
-				if ( abs($client_total - $expected_total) > 0.02 ) {
+				if ( abs($posted_subtotal - $expected_total) > 0.02 ) {
 					$validation_result['is_valid'] = false;
-					$validation_result['form'] = $this->gf_mark_field_invalid($form, self::GF_FIELD_TOTAL, __('Total: Price mismatch. Please refresh the page and submit again.', 'tc-booking-flow'));
+					$validation_result['form'] = $this->gf_mark_field_invalid($form, $subtotal_field_id, __('Total: Price mismatch. Please refresh the page and submit again.', 'tc-booking-flow'));
 					return $validation_result;
 				}
 			} else {
 				// Self-heal: set the client total server-side
-				$_POST['input_' . self::GF_FIELD_TOTAL] = wc_format_decimal($expected_total, 2);
+				$_POST['input_' . $subtotal_field_id] = wc_format_decimal($expected_total, 2);
+				// Keep legacy field 76 in sync if subtotal field is 173
+				if ( $subtotal_field_id === self::GF_FIELD_SUBTOTAL ) {
+					$_POST['input_' . self::GF_FIELD_TOTAL] = wc_format_decimal($expected_total, 2);
+				}
 			}
 		}
 
@@ -1042,741 +1059,20 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		 * We always snapshot it into BK_CUSTOM_COST so Woo Bookings cannot drift.
 		 * If meta is missing, we fall back to the GF total as a last-resort safety net.
 		 */
-		$part_price = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
-		if ( $part_price > 0 ) {
-			$cart_item_meta_part['booking'][self::BK_CUSTOM_COST] = wc_format_decimal($part_price, 2);
-		} else {
-			$legacy_total = (float) rgar($entry, (string) self::GF_FIELD_TOTAL);
-			if ( $legacy_total > 0 ) {
-				$cart_item_meta_part['booking'][self::BK_CUSTOM_COST] = wc_format_decimal($legacy_total, 2);
-			}
-		}
+		$part_price   = $this->money_to_float( get_post_meta($event_id, 'event_price', true) );
 
-		// -------------------------------------------------
-		// EB discount distribution (event-wise meta rules)
-		// Compute once per submission and distribute across eligible scopes.
-		// -------------------------------------------------
-		$base_part = isset($cart_item_meta_part['booking'][self::BK_CUSTOM_COST]) ? (float) $cart_item_meta_part['booking'][self::BK_CUSTOM_COST] : 0.0;
-		$eligible_bases = [];
-		if ( $eligible_part && $base_part > 0 ) {
-			$eligible_bases['part'] = $base_part;
-		}
-
-		$rental_fixed_preview = 0.0;
-		$eligible_rental = false;
-		if ( $has_rental ) {
-			$eligible_rental = ! empty($cfg['enabled']) && ! empty($cfg['rental_enabled']);
-			// We need the fixed rental price now (to correctly distribute EB across scopes).
-			$rental_fixed_preview = $this->get_event_rental_price($event_id, $entry, $product_id_bicycle);
-			if ( $eligible_rental && $rental_fixed_preview > 0 ) {
-				$eligible_bases['rental'] = (float) $rental_fixed_preview;
-			}
-		}
-
-		$eb_total_amt = 0.0;
-		$eb_eff_pct   = 0.0;
-		$eb_amt_part  = 0.0;
-		$eb_amt_rental = 0.0;
-		$eligible_sum = array_sum($eligible_bases);
-		if ( ! empty($cfg['enabled']) && $eligible_sum > 0 && $eb_step ) {
-			$comp = $this->compute_eb_amount((float)$eligible_sum, $eb_step, (array)($cfg['global_cap'] ?? []));
-			$eb_total_amt = (float) ($comp['amount'] ?? 0.0);
-			$eb_eff_pct   = (float) ($comp['effective_pct'] ?? 0.0);
-
-			if ( $eb_total_amt > 0 ) {
-				// Proportional distribution with rounding.
-				if ( isset($eligible_bases['part']) && $eligible_bases['part'] > 0 ) {
-					$eb_amt_part = round($eb_total_amt * ($eligible_bases['part'] / $eligible_sum), 2);
-				}
-				if ( isset($eligible_bases['rental']) && $eligible_bases['rental'] > 0 ) {
-					$eb_amt_rental = round($eb_total_amt * ($eligible_bases['rental'] / $eligible_sum), 2);
-				}
-				// Fix rounding drift on last eligible line.
-				$drift = round($eb_total_amt - ($eb_amt_part + $eb_amt_rental), 2);
-				if ( abs($drift) > 0.0001 ) {
-					if ( isset($eligible_bases['rental']) ) {
-						$eb_amt_rental = max(0.0, $eb_amt_rental + $drift);
-					} else {
-						$eb_amt_part = max(0.0, $eb_amt_part + $drift);
-					}
-				}
-			}
-		}
-
-		// Apply EB snapshot fields (audit) to participation booking payload
-		$cart_item_meta_part['booking'][self::BK_EB_ELIGIBLE] = $eligible_part ? 1 : 0;
-		$cart_item_meta_part['booking'][self::BK_EB_PCT]      = $eligible_part ? wc_format_decimal($eb_eff_pct, 2) : '0';
-		$cart_item_meta_part['booking'][self::BK_EB_AMOUNT]   = $eligible_part ? wc_format_decimal($eb_amt_part, 2) : '0';
-
-
-		$cart_obj = WC()->cart;
-
-		$added_keys = [];
-
-		// If participation product requires resource and rental exists, use rental resource as fallback (legacy compatibility)
-		if ( $part_requires_resource && $has_rental ) {
-			$cart_item_meta_part['booking']['resource_id'] = $resource_id_bicycle;
-			$cart_item_meta_part['booking']['wc_bookings_field_resource'] = $resource_id_bicycle;
-		}
-
-		$this->log('cart.add.participation', ['event_id'=>$event_id,'product_id'=>$product_id_participation,'custom_cost'=>$cart_item_meta_part['booking'][self::BK_CUSTOM_COST] ?? null,'duration_days'=>$duration_days]);
-		$added_part = $cart_obj->add_to_cart($product_id_participation, $quantity, 0, [], $cart_item_meta_part);
-		if ( $added_part ) { $this->log('cart.add.participation.ok', ['cart_key'=>$added_part]); }
-		if ( $added_part ) $added_keys[] = $added_part;
-
-		// -------------------------
-		// Add rental as separate cart item (only if scheme supports it)
-		// -------------------------
-		if ( $has_rental ) {
-
-			$product_rental = wc_get_product($product_id_bicycle);
-
-			if ( $product_rental && function_exists('is_wc_booking_product') && is_wc_booking_product($product_rental) ) {
-
-				$sim_post_rental = [
-					'wc_bookings_field_duration'         => $duration_days,
-					'wc_bookings_field_start_date_year'  => $start_year,
-					'wc_bookings_field_start_date_month' => $start_month,
-					'wc_bookings_field_start_date_day'   => $start_day,
-					'wc_bookings_field_resource'         => $resource_id_bicycle,
-				];
-
-				$cart_item_meta_rental = [];
-				$cart_item_meta_rental['booking'] = wc_bookings_get_posted_data($sim_post_rental, $product_rental);
-
-				$cart_item_meta_rental['booking'][self::BK_EVENT_ID]    = $event_id;
-				$cart_item_meta_rental['booking'][self::BK_EVENT_TITLE] = $event_title;
-				$cart_item_meta_rental['booking'][self::BK_ENTRY_ID]    = $entry_id;
-				$cart_item_meta_rental['booking'][self::BK_SCOPE]       = 'rental';
-
-				// Participant + bicycle label snapshots (for cart/order display)
-				$participant_name = trim($first . ' ' . $last);
-				if ( $participant_name !== '' ) {
-					$cart_item_meta_rental['booking']['_participant'] = $participant_name;
-				}
-
-				$bicycle_label = '';
-				if ( is_object($product_rental) && method_exists($product_rental, 'get_name') ) {
-					$bicycle_label = (string) $product_rental->get_name();
-				}
-				if ( $resource_id_bicycle > 0 ) {
-					$res_title = $this->localize_post_title( $resource_id_bicycle );
-					if ( $res_title ) {
-						$bicycle_label = $bicycle_label ? ($bicycle_label . ' — ' . $res_title) : (string) $res_title;
-					}
-				}
-				if ( $bicycle_label !== '' ) {
-					$cart_item_meta_rental['booking']['_bicycle'] = $bicycle_label;
-				}
-
-
-				// EB snapshot fields for rental (distributed amounts computed above)
-				$cart_item_meta_rental['booking'][self::BK_EB_ELIGIBLE] = $eligible_rental ? 1 : 0;
-				$cart_item_meta_rental['booking'][self::BK_EB_PCT]      = $eligible_rental ? wc_format_decimal($eb_eff_pct, 2) : '0';
-				$cart_item_meta_rental['booking'][self::BK_EB_AMOUNT]   = $eligible_rental ? wc_format_decimal($eb_amt_rental, 2) : '0';
-				$cart_item_meta_rental['booking'][self::BK_EB_DAYS]     = (string) $eb_days;
-				$cart_item_meta_rental['booking'][self::BK_EB_EVENT_TS] = (string) $eb_evt_ts;
-					// Rental price is fixed per event (stored on event meta) and must be snapshotted.
-					$rental_fixed = $rental_fixed_preview;
-					if ( $rental_fixed <= 0 ) {
-						$rental_fixed = $this->get_event_rental_price($event_id, $entry, $product_id_bicycle);
-					}
-					if ( $rental_fixed > 0 ) {
-						$cart_item_meta_rental['booking'][self::BK_CUSTOM_COST] = wc_format_decimal($rental_fixed, 2);
-					}
-
-				$this->log('cart.add.rental', [
-					'event_id' => $event_id,
-					'product_id' => $product_id_bicycle,
-					'resource_id' => $resource_id_bicycle,
-					'custom_cost' => ($cart_item_meta_rental['booking'][self::BK_CUSTOM_COST] ?? ''),
-					'eligible_eb' => ($cart_item_meta_rental['booking'][self::BK_EB_ELIGIBLE] ?? 0),
-				]);
-				$added_rental = $cart_obj->add_to_cart($product_id_bicycle, $quantity, 0, [], $cart_item_meta_rental);
-				if ( $added_rental ) $added_keys[] = $added_rental;
-			}
-		}
-
-		// Apply coupon after items exist (Woo validates)
-		if ( $coupon_code && $added_keys ) {
-			$cart_obj->add_discount($coupon_code);
-		}
-
-		// Mark GF entry only if we added at least the participation line
-		if ( $added_part ) {
-			$this->gf_entry_mark_cart_added($entry_id);
-		}
-	}
-
-	/* =========================================================
-	 * GF notifications (parity with legacy snippets)
-	 * ========================================================= */
-
-	/**
-	 * Register custom GF notification events.
-	 * Legacy key: WC___paid
-	 */
-	public function gf_register_notification_events( array $events ) : array {
-		$events['WC___paid']    = __( 'Woocommerce payment confirmed', 'tc-booking-flow' );
-		$events['WC___settled'] = __( 'Reservation confirmed (invoice/offline)', 'tc-booking-flow' );
-		return $events;
-	}
-
-	/**
-	 * Fire GF notifications when Woo payment is confirmed.
-	 *
-	 * Hooks:
-	 * - woocommerce_payment_complete (order id)
-	 * - woocommerce_order_status_processing/completed (order id, order)
-	 */
-	public function woo_fire_gf_paid_notifications( $order_id, $maybe_order = null ) : void {
-		$order_id = (int) $order_id;
-		if ( $order_id <= 0 ) return;
-
-		// Avoid duplicate sends.
-		$sent_flag = (string) get_post_meta( $order_id, '_tc_gf_paid_notifs_sent', true );
-		if ( $sent_flag === '1' ) return;
-
-		if ( ! class_exists('GFAPI') ) return;
-
-		$order = $maybe_order;
-		if ( ! $order || ! is_object($order) || ! is_a($order, 'WC_Order') ) {
-			$order = wc_get_order( $order_id );
-		}
-		if ( ! $order ) return;
-
-		// Gather GF entry ids from line items.
-		$entry_ids = [];
-		foreach ( $order->get_items() as $item ) {
-			if ( ! is_object($item) || ! method_exists($item, 'get_meta') ) continue;
-			$eid = (int) $item->get_meta( '_gf_entry_id', true );
-			if ( $eid > 0 ) $entry_ids[] = $eid;
-		}
-		$entry_ids = array_values( array_unique( array_filter( $entry_ids ) ) );
-		if ( ! $entry_ids ) return;
-
-		$did_any = false;
-		foreach ( $entry_ids as $entry_id ) {
-			try {
-				$entry = \GFAPI::get_entry( (int) $entry_id );
-				if ( is_wp_error($entry) || ! is_array($entry) ) continue;
-				$form_id = (int) rgar( $entry, 'form_id' );
-				if ( $form_id <= 0 ) {
-					$form_id = (int) \TC_BF\Admin\Settings::get_form_id();
-				}
-				if ( $form_id <= 0 ) continue;
-
-				$form = \GFAPI::get_form( $form_id );
-				if ( ! is_array($form) || empty($form['id']) ) continue;
-
-				// Send custom notifications.
-				\GFAPI::send_notifications( $form, $entry, 'WC___paid' );
-				$did_any = true;
-			} catch ( \Throwable $e ) {
-				$this->log('gf.notif.wc_paid.exception', [
-					'order_id' => $order_id,
-					'entry_id' => (int) $entry_id,
-					'err'      => $e->getMessage(),
-				], 'error');
-			}
-		}
-
-		if ( $did_any ) {
-			update_post_meta( $order_id, '_tc_gf_paid_notifs_sent', '1' );
-			$this->log('gf.notif.wc_paid.sent', ['order_id'=>$order_id,'entry_ids'=>$entry_ids]);
-		}
-	}
-
-	/**
-	 * Fire GF notifications when an order is confirmed via invoice/offline settlement.
-	 *
-	 * Hook: woocommerce_order_status_invoiced (order id, order)
-	 */
-	public function woo_fire_gf_settled_notifications( $order_id, $maybe_order = null ) : void {
-		$order_id = (int) $order_id;
-		if ( $order_id <= 0 ) return;
-
-		// De-dupe: send once per order.
-		if ( get_post_meta( $order_id, '_tc_gf_settled_notifs_sent', true ) ) return;
-
-		$order = $maybe_order;
-		if ( ! $order || ! is_object($order) || ! is_a($order, 'WC_Order') ) {
-			$order = wc_get_order( $order_id );
-		}
-		if ( ! $order ) return;
-
-		// Gather GF entry ids from line items.
-		$entry_ids = [];
-		foreach ( $order->get_items() as $item ) {
-			if ( ! is_object($item) || ! method_exists($item, 'get_meta') ) continue;
-			$eid = (int) $item->get_meta( '_gf_entry_id', true );
-			if ( $eid > 0 ) $entry_ids[] = $eid;
-		}
-		$entry_ids = array_values( array_unique( array_filter( $entry_ids ) ) );
-		if ( empty( $entry_ids ) ) return;
-
-		if ( ! class_exists('GFAPI') ) return;
-
-		foreach ( $entry_ids as $eid ) {
-			$entry = \GFAPI::get_entry( $eid );
-			if ( is_wp_error($entry) || empty($entry) ) continue;
-
-			$form = \GFAPI::get_form( (int)$entry['form_id'] );
-			if ( empty($form) ) continue;
-
-			\GFAPI::send_notifications( $form, $entry, 'WC___settled' );
-		}
-
-		update_post_meta( $order_id, '_tc_gf_settled_notifs_sent', 1 );
-		$this->log('gf.settled_notifs.sent', [ 'order_id' => $order_id, 'entry_ids' => $entry_ids ]);
-	}
-
-
-	/**
-	 * Resolve participation product ID.
-	 * Keep your existing mapping logic here (categories → product IDs, rental/no rental, etc.).
-	 *
-	 * For now, this method returns the legacy tour product id if you stored it on the event,
-	 * or 0 if nothing is available.
-	 */
-	private function resolve_participation_product_id( int $event_id, $entry ) : int {
-
-	// 1) Explicit per-event override (strongest)
-	$pid = (int) get_post_meta($event_id, 'tc_participation_product_id', true);
-	if ( $pid > 0 && $this->is_valid_participation_product($pid) ) {
-		$this->log('resolver.participation.override_event', ['event_id'=>$event_id,'product_id'=>$pid]);
-		return $pid;
-	}
-
-	// 2) Legacy fallback (if you stored a general product_id)
-	$pid = (int) get_post_meta($event_id, 'tc_product_id', true);
-	if ( $pid > 0 && $this->is_valid_participation_product($pid) ) {
-		$this->log('resolver.participation.override_legacy_meta', ['event_id'=>$event_id,'product_id'=>$pid]);
-		return $pid;
-	}
-
-	// 3) Category slug → participation product meta mapping (recommended)
-	$slugs = wp_get_post_terms( (int) $event_id, 'sc_event_category', [ 'fields' => 'slugs' ] );
-	if ( is_wp_error($slugs) ) $slugs = [];
-	$slugs = array_values(array_filter(array_map('strval', (array)$slugs)));
-
-	if ( $slugs ) {
-		$mapped = $this->find_participation_product_by_category_slugs($slugs);
-		if ( $mapped > 0 ) { $this->log('resolver.participation.category_mapped', ['event_id'=>$event_id,'product_id'=>$mapped,'slugs'=>$slugs]); return $mapped; }
-	}
-
-	// 4) Legacy hardcoded fallback mapping (safe during transition).
-	// NOTE: In the new model, rental does NOT affect participation product selection.
-	$map = apply_filters('tc_bf_participation_product_map', [
-		// Canonical "no rental" participation products:
-		'guided' => 37916,
-		'tdg'    => 48161,
-	], $event_id, $slugs);
-
-	$tdg_slugs    = apply_filters('tc_bf_tdg_category_slugs',    [ 'tour_de_girona' ]);
-	$guided_slugs = apply_filters('tc_bf_guided_category_slugs', [ 'salidas_guiadas' ]);
-
-	$is_tdg = (bool) array_intersect( (array) $tdg_slugs, (array) $slugs );
-	$type   = $is_tdg ? 'tdg' : 'guided';
-
-	if ( isset($map[$type]) && (int) $map[$type] > 0 && $this->is_valid_participation_product((int)$map[$type]) ) {
-		$this->log('resolver.participation.legacy_map', ['event_id'=>$event_id,'type'=>$type,'product_id'=>(int)$map[$type],'slugs'=>$slugs]);
-		return (int) $map[$type];
-	}
-
-	$this->log('resolver.participation.not_found', ['event_id'=>$event_id,'slugs'=>$slugs]);
-	return 0;
+// IMPORTANT:
+// - Field 76 (GF "Total") can become discounted if you show EB/partner totals in the form.
+// - For validation we must compare against the *undiscounted* subtotal.
+//   We use field 173 ("S") if present; otherwise we fall back to field 76.
+$posted_subtotal = 0.0;
+if ( isset($_POST['input_' . self::GF_FIELD_SUBTOTAL]) ) {
+	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_SUBTOTAL];
+} elseif ( isset($_POST['input_' . self::GF_FIELD_TOTAL]) ) {
+	$posted_subtotal = (float) $_POST['input_' . self::GF_FIELD_TOTAL];
 }
-
-	/* =========================================================
-	 * Woo Bookings + Woo pricing
-	 * ========================================================= */
-
-	public function woo_override_booking_cost( $cost, $book_obj, $posted ) {
-		if ( isset($posted[self::BK_CUSTOM_COST]) ) {
-			$this->log('woo.bookings.override_cost', ['custom_cost'=>(float)$posted[self::BK_CUSTOM_COST]]);
-			return (float) $posted[self::BK_CUSTOM_COST];
-		}
-		return $cost;
-	}
-
-	public function woo_apply_eb_snapshot_to_cart( $cart ) {
-
-		if ( is_admin() && ! defined('DOING_AJAX') ) return;
-		if ( ! $cart || ! is_a($cart, 'WC_Cart') ) return;
-
-		foreach ( $cart->get_cart() as $key => $item ) {
-
-			if ( empty($item['booking']) || empty($item['booking'][self::BK_EVENT_ID]) ) continue;
-
-			$booking = (array) $item['booking'];
-			$scope   = isset($booking[self::BK_SCOPE]) ? (string) $booking[self::BK_SCOPE] : '';
-
-			$product = $item['data'] ?? null;
-			if ( ! $product || ! is_object($product) || ! method_exists($product, 'set_price') ) continue;
-
-			// -------------------------------------------------
-			// PRICE SNAPSHOT (authoritative, once)
-			// -------------------------------------------------
-			// Rental MUST be snapshotted at add-to-cart time so Woo Bookings pricing
-			// cannot drift or double-count later.
-			if ( $scope === 'rental' && empty($booking[self::BK_CUSTOM_COST]) ) {
-				$cost = $this->calculate_booking_cost_snapshot($product, $booking);
-				if ( $cost !== null ) {
-					$cart->cart_contents[$key]['booking'][self::BK_CUSTOM_COST] = wc_format_decimal((float)$cost, 2);
-					$booking[self::BK_CUSTOM_COST] = (float) $cost;
-				}
-			}
-
-			// If we have a snapshotted cost, enforce it on the cart item price.
-			if ( isset($booking[self::BK_CUSTOM_COST]) && $booking[self::BK_CUSTOM_COST] !== '' ) {
-				$product->set_price( (float) $booking[self::BK_CUSTOM_COST] );
-				$this->log('woo.cart.set_price_snapshot', ['key'=>$key,'scope'=>$scope,'event_id'=>(int)$booking[self::BK_EVENT_ID],'price'=>(float)$booking[self::BK_CUSTOM_COST]]);
-			}
-
-			// -------------------------------------------------
-			// EARLY BOOKING (discount snapshot applied on top)
-			// -------------------------------------------------
-			$eligible = ! empty($booking[self::BK_EB_ELIGIBLE]);
-			if ( ! $eligible ) continue;
-
-			$pct = isset($booking[self::BK_EB_PCT]) ? (float) $booking[self::BK_EB_PCT] : 0.0;
-			$amt = isset($booking[self::BK_EB_AMOUNT]) ? (float) $booking[self::BK_EB_AMOUNT] : 0.0;
-			if ( $pct <= 0 && $amt <= 0 ) continue;
-
-			// Base price snapshot per line (store in booking meta)
-			if ( empty($booking[self::BK_EB_BASE]) ) {
-				$base = isset($booking[self::BK_CUSTOM_COST]) ? (float) $booking[self::BK_CUSTOM_COST] : (float) $product->get_price();
-				$cart->cart_contents[$key]['booking'][self::BK_EB_BASE] = wc_format_decimal($base, 2);
-			} else {
-				$base = (float) $booking[self::BK_EB_BASE];
-			}
-
-			if ( $amt > 0 ) {
-				$new = round( $base - $amt, 2 );
-			} else {
-				$new = round( $base * (1 - ($pct/100)), 2 );
-			}
-			if ( $new < 0 ) $new = 0;
-
-			$product->set_price( $new );
-		}
-	}
-
-
-	/* =========================================================
-	 * Cart display (frontend)
-	 * ========================================================= */
-
-	public function woo_cart_item_data( array $item_data, array $cart_item ) : array {
-
-		if ( empty($cart_item["booking"]) || ! is_array($cart_item["booking"]) ) return $item_data;
-		$booking = (array) $cart_item["booking"];
-
-		// Event title
-		if ( ! empty($booking[self::BK_EVENT_TITLE]) ) {
-			$item_data[] = [
-				"name"  => __("Event", "tc-booking-flow"),
-				"value" => wc_clean((string) $booking[self::BK_EVENT_TITLE]),
-			];
-		}
-
-		// Participant
-		if ( ! empty($booking["_participant"]) ) {
-			$item_data[] = [
-				"name"  => __("Participant", "tc-booking-flow"),
-				"value" => wc_clean((string) $booking["_participant"]),
-			];
-		}
-
-		// Scope (participation/rental)
-		if ( ! empty($booking[self::BK_SCOPE]) ) {
-			$scope = (string) $booking[self::BK_SCOPE];
-			$label = $scope === "rental" ? __("Rental", "tc-booking-flow") : __("Participation", "tc-booking-flow");
-			$item_data[] = [
-				"name"  => __("Type", "tc-booking-flow"),
-				"value" => wc_clean($label),
-			];
-		}
-
-		// Bicycle label (rental line only)
-		if ( ! empty($booking["_bicycle"]) ) {
-			$item_data[] = [
-				"name"  => __("Bike", "tc-booking-flow"),
-				"value" => wc_clean((string) $booking["_bicycle"]),
-			];
-		}
-
-		return $item_data;
-	}
-
-	/**
-	 * Calculate a stable booking cost snapshot for a cart line.
-	 *
-	 * We intentionally calculate once and then enforce via set_price() + BK_CUSTOM_COST.
-	 * This prevents Woo Bookings from recalculating later in the funnel.
-	 */
-	private function calculate_booking_cost_snapshot( $product, array $booking ) : ?float {
-
-		// Strip our internal meta keys from the posted array.
-		$posted = $booking;
-		unset(
-			$posted[self::BK_EVENT_ID],
-			$posted[self::BK_EVENT_TITLE],
-			$posted[self::BK_ENTRY_ID],
-			$posted[self::BK_SCOPE],
-			$posted[self::BK_EB_PCT],
-			$posted[self::BK_EB_ELIGIBLE],
-			$posted[self::BK_EB_DAYS],
-			$posted[self::BK_EB_BASE],
-			$posted[self::BK_EB_EVENT_TS],
-			$posted[self::BK_CUSTOM_COST]
-		);
-
-		// Primary path: Woo Bookings cost calculator (if available).
-		if ( class_exists('WC_Bookings_Cost_Calculation') && is_callable(['WC_Bookings_Cost_Calculation', 'calculate_booking_cost']) ) {
-			try {
-				$cost = \WC_Bookings_Cost_Calculation::calculate_booking_cost( $posted, $product );
-				if ( is_numeric($cost) ) return (float) $cost;
-			} catch ( \Throwable $e ) {
-				return null;
-			}
-		}
-
-		// Fallback: if Woo already set a price for this cart item, we can snapshot it.
-		// (Better than nothing; still locks the number.)
-		if ( is_object($product) && method_exists($product, 'get_price') ) {
-			$maybe = (float) $product->get_price();
-			if ( $maybe > 0 ) return $maybe;
-		}
-
-		return null;
-	}
-
-	/**
-	 * Localize multilingual strings for setups using qTranslate-X / qTranslate-XT.
-	 * If no multilingual plugin is detected, returns the string unchanged.
-	 */
-	private function localize_text( string $text ) : string {
-		if ( $text === '' ) return '';
-		if ( function_exists('qtranxf_useCurrentLanguageIfNotFound') ) {
-			return (string) qtranxf_useCurrentLanguageIfNotFound( $text );
-		}
-		if ( function_exists('qtrans_useCurrentLanguageIfNotFound') ) {
-			return (string) qtrans_useCurrentLanguageIfNotFound( $text );
-		}
-		return $text;
-	}
-
-	/**
-	 * Get a post title in the current language when using multilingual plugins.
-	 */
-	private function localize_post_title( int $post_id ) : string {
-		if ( $post_id <= 0 ) return '';
-		$title = get_the_title( $post_id );
-		if ( ! is_string($title) ) $title = (string) $title;
-		return $this->localize_text( $title );
-	}
-
-
-	/**
-	 * Convert stored money strings to float.
-	 * Accepts values like: "20", "20.00", "20,00", "20 €".
-	 */
-	private function money_to_float( $val ) : float {
-		if ( is_numeric($val) ) return (float) $val;
-		$s = trim((string) $val);
-		if ( $s === '' ) return 0.0;
-		// keep digits, comma, dot, minus
-		$s = preg_replace('/[^0-9,\.\-]/', '', $s);
-		// If comma is used as decimal separator and dot as thousands, normalize.
-		if ( substr_count($s, ',') === 1 && substr_count($s, '.') >= 1 ) {
-			// assume last separator is decimal, remove the other
-			if ( strrpos($s, ',') > strrpos($s, '.') ) {
-				$s = str_replace('.', '', $s);
-				$s = str_replace(',', '.', $s);
-			} else {
-				$s = str_replace(',', '', $s);
-			}
-		} elseif ( substr_count($s, ',') === 1 && substr_count($s, '.') === 0 ) {
-			$s = str_replace(',', '.', $s);
-		} else {
-			// multiple commas: treat as thousands
-			if ( substr_count($s, ',') > 1 ) $s = str_replace(',', '', $s);
-		}
-		return is_numeric($s) ? (float) $s : 0.0;
-	}
-
-	/**
-	 * Resolve a rental price (fixed per event) based on GF rental type or rental product category.
-	 * Event meta keys used by current snippets:
-	 * - rental_price_road
-	 * - rental_price_mtb
-	 * - rental_price_ebike
-	 * - rental_price_gravel
-	 */
-	private function get_event_rental_price( int $event_id, $entry, int $rental_product_id ) : float {
-		// 1) Prefer GF rental type select (field 106)
-		$rental_raw = trim((string) rgar($entry, (string) self::GF_FIELD_RENTAL_TYPE));
-		$key = '';
-		if ( $rental_raw !== '' ) {
-			$rt = strtoupper($rental_raw);
-			if ( strpos($rt, 'ROAD') === 0 )       $key = 'rental_price_road';
-			elseif ( strpos($rt, 'MTB') === 0 )    $key = 'rental_price_mtb';
-			elseif ( strpos($rt, 'EMTB') === 0 )   $key = 'rental_price_ebike';
-			elseif ( strpos($rt, 'E-MTB') === 0 )  $key = 'rental_price_ebike';
-			elseif ( strpos($rt, 'E MTB') === 0 )  $key = 'rental_price_ebike';
-			elseif ( strpos($rt, 'GRAVEL') === 0 ) $key = 'rental_price_gravel';
-		}
-
-		// 2) Fallback: infer from product categories
-		if ( $key === '' && $rental_product_id > 0 ) {
-			$terms = get_the_terms( $rental_product_id, 'product_cat' );
-			if ( is_array($terms) ) {
-				$slugs = [ ];
-				foreach ( $terms as $t ) { if ( isset($t->slug) ) $slugs[] = (string) $t->slug; }
-				$slugs = array_unique($slugs);
-				if ( in_array('rental_road', $slugs, true) )   $key = 'rental_price_road';
-				elseif ( in_array('rental_mtb', $slugs, true) ) $key = 'rental_price_mtb';
-				elseif ( in_array('rental_emtb', $slugs, true) )$key = 'rental_price_ebike';
-				elseif ( in_array('rental_gravel', $slugs, true) )$key = 'rental_price_gravel';
-			}
-		}
-
-		if ( $key === '' ) return 0.0;
-		return $this->money_to_float( get_post_meta($event_id, $key, true) );
-	}
-
-	/* =========================================================
-	 * Cart → Order meta copy-through (extend your existing behavior)
-	 * ========================================================= */
-
-	public function woo_checkout_create_order_line_item( $item, $cart_item_key, $values, $order ) {
-
-		$cart_item = WC()->cart ? WC()->cart->get_cart_item( $cart_item_key ) : [];
-		$booking   = ( isset($cart_item['booking']) && is_array($cart_item['booking']) ) ? $cart_item['booking'] : [];
-
-		if ( ! empty( $booking[self::BK_EVENT_ID] ) ) {
-			$item->add_meta_data( '_event_id', $booking[self::BK_EVENT_ID] );
-		}
-		if ( ! empty( $booking[self::BK_EVENT_TITLE] ) ) {
-			$item->add_meta_data( 'event', $booking[self::BK_EVENT_TITLE] );
-		}
-		if ( ! empty( $booking['_participant'] ) ) {
-			$item->add_meta_data( 'participant', $booking['_participant'] );
-		}
-		if ( ! empty( $booking['_bicycle'] ) ) {
-			$item->add_meta_data( '_bicycle', $booking['_bicycle'] );
-		}
-		if ( ! empty( $booking[self::BK_ENTRY_ID] ) ) {
-			$item->add_meta_data( '_gf_entry_id', $booking[self::BK_ENTRY_ID] );
-		}
-		if ( ! empty( $booking['_participant_email'] ) ) {
-			$item->add_meta_data( 'email', $booking['_participant_email'] );
-		}
-		if ( ! empty( $booking['_confirmation'] ) ) {
-			$item->add_meta_data( 'confirmation', __('[:es]Enviar email de confirmación al participante[:en]Send email confirmation to participant[:]') );
-		}
-
-		// New: scope + EB snapshot audit
-		if ( ! empty( $booking[self::BK_SCOPE] ) ) {
-			$item->add_meta_data( '_tc_scope', $booking[self::BK_SCOPE] );
-		}
-		if ( isset($booking[self::BK_EB_PCT]) ) {
-			$item->add_meta_data( '_eb_pct', wc_format_decimal((float)$booking[self::BK_EB_PCT], 2) );
-		}
-		if ( isset($booking[self::BK_EB_AMOUNT]) ) {
-			$item->add_meta_data( '_eb_amount', wc_format_decimal((float)$booking[self::BK_EB_AMOUNT], 2) );
-		}
-		if ( isset($booking[self::BK_EB_ELIGIBLE]) ) {
-			$item->add_meta_data( '_eb_eligible', (int) $booking[self::BK_EB_ELIGIBLE] );
-		}
-		if ( isset($booking[self::BK_EB_DAYS]) ) {
-			$item->add_meta_data( '_eb_days_before', (int) $booking[self::BK_EB_DAYS] );
-		}
-		if ( isset($booking[self::BK_EB_BASE]) ) {
-			$item->add_meta_data( '_eb_base_price', wc_format_decimal((float)$booking[self::BK_EB_BASE], 2) );
-		}
-		if ( isset($booking[self::BK_EB_EVENT_TS]) ) {
-			$item->add_meta_data( '_eb_event_start_ts', (string) $booking[self::BK_EB_EVENT_TS] );
-		}
-	}
-
-	/* =========================================================
-	 * Partner meta on order (kept, improved base detection)
-	 * ========================================================= */
-
-	public function partner_persist_order_meta( $order, $data ) {
-
-		if ( ! $order || ! is_a($order, 'WC_Order') ) return;
-
-		if ( $order->get_meta('partner_code') || $order->get_meta('partner_commission') || $order->get_meta('client_total') ) {
-			return;
-		}
-
-		$coupon_codes = $order->get_coupon_codes();
-		if ( empty($coupon_codes) ) return;
-
-		$partner_user_id = 0;
-		$partner_code    = '';
-
-		foreach ( $coupon_codes as $code ) {
-			$code = wc_format_coupon_code( $code );
-			if ( $code === '' ) continue;
-
-			$users = get_users([
-				'meta_key'   => 'discount__code',
-				'meta_value' => $code,
-				'number'     => 1,
-				'fields'     => 'ids',
-			]);
-
-			if ( ! empty($users[0]) ) {
-				$partner_user_id = (int) $users[0];
-				$partner_code    = $code;
-				break;
-			}
-		}
-
-		if ( ! $partner_user_id || $partner_code === '' ) return;
-
-		$partner_commission_rate = (float) get_user_meta( $partner_user_id, 'usrdiscount', true );
-		if ( $partner_commission_rate < 0 ) $partner_commission_rate = 0;
-
-		$partner_discount_pct = 0.0;
-		$partner_coupon_type  = '';
-		try {
-			$coupon = new \WC_Coupon( $partner_code );
-			$partner_coupon_type = (string) $coupon->get_discount_type();
-			if ( $partner_coupon_type === 'percent' ) {
-				$partner_discount_pct = (float) $coupon->get_amount();
-				if ( $partner_discount_pct < 0 ) $partner_discount_pct = 0;
-			}
-		} catch ( \Exception $e ) {}
-
-		// Base before EB and before coupons: prefer _eb_base_price snapshots if present
-		$subtotal_original = 0.0;
-		foreach ( $order->get_items() as $item ) {
-
-			$event_id = $item->get_meta('_event_id', true);
-			if ( ! $event_id ) continue;
-
-			$base = $item->get_meta('_eb_base_price', true);
-			if ( $base !== '' ) {
-				$subtotal_original += (float) $base * max(1, (int) $item->get_quantity());
-			} else {
-				$subtotal_original += (float) $item->get_subtotal();
-			}
-		}
-		if ( $subtotal_original <= 0 ) $subtotal_original = (float) $order->get_subtotal();
-
-		// EB pct stored on order later by ledger; here we set placeholder 0 (ledger updates after)
-		$early_booking_discount_pct = 0.0;
-		$partner_base_total = $subtotal_original;
-
-		$client_total = $partner_base_total * (1 - ($partner_discount_pct / 100));
 		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount = max(0.0, $partner_base_total - $client_total);
+		$client_discount = max(0.0, $partner_base_total - $posted_subtotal);
 
 		$order->update_meta_data('partner_id', (string) $partner_user_id);
 		$order->update_meta_data('partner_code', $partner_code);
@@ -1789,7 +1085,7 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
 		$order->update_meta_data('partner_base_total', wc_format_decimal($partner_base_total, 2));
 
-		$order->update_meta_data('client_total', wc_format_decimal($client_total, 2));
+		$order->update_meta_data('client_total', wc_format_decimal($posted_subtotal, 2));
 		$order->update_meta_data('client_discount', wc_format_decimal($client_discount, 2));
 		$order->update_meta_data('partner_commission', wc_format_decimal($partner_commission, 2));
 		$order->update_meta_data('tc_ledger_version', '2');
@@ -1856,9 +1152,9 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		if ( $partner_commission_rate < 0 ) $partner_commission_rate = 0;
 
 		$partner_base_total = max(0, $subtotal_original - $eb_amount_total);
-		$client_total       = $partner_base_total * (1 - ($partner_discount_pct / 100));
+		$posted_subtotal       = $partner_base_total * (1 - ($partner_discount_pct / 100));
 		$partner_commission = $partner_base_total * ($partner_commission_rate / 100);
-		$client_discount    = max(0.0, $partner_base_total - $client_total);
+		$client_discount    = max(0.0, $partner_base_total - $posted_subtotal);
 
 		$order->update_meta_data('subtotal_original', wc_format_decimal($subtotal_original, 2));
 
@@ -1873,7 +1169,7 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		}
 
 		$order->update_meta_data('partner_base_total', wc_format_decimal($partner_base_total, 2));
-		$order->update_meta_data('client_total', wc_format_decimal($client_total, 2));
+		$order->update_meta_data('client_total', wc_format_decimal($posted_subtotal, 2));
 		$order->update_meta_data('client_discount', wc_format_decimal($client_discount, 2));
 		$order->update_meta_data('partner_commission', wc_format_decimal($partner_commission, 2));
 		$order->update_meta_data('tc_ledger_version', '2');
