@@ -65,7 +65,7 @@ jobs:
             -oBatchMode=no \
             -oStrictHostKeyChecking=no \
             -oUserKnownHostsFile=/dev/null \
-            -p 22 \
+            -P 22 \
             -b sftp-probe.txt \
             "$SFTP_USER@$SFTP_HOST"
 
@@ -94,6 +94,6 @@ jobs:
             -oBatchMode=no \
             -oStrictHostKeyChecking=no \
             -oUserKnownHostsFile=/dev/null \
-            -p 22 \
+            -P 22 \
             -b sftp-batch.txt \
             "$SFTP_USER@$SFTP_HOST"
