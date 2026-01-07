@@ -224,12 +224,27 @@ final class Plugin {
 			$partners = $this->get_partner_users_for_dropdown();
 
 			if ( ! empty($form['fields']) && is_array($form['fields']) ) {
-				foreach ( $form['fields'] as &$field ) {
-					if ( ! is_array($field) ) continue;
-					$fid = (int) ($field['id'] ?? 0);
-					if ( $fid !== self::GF_FIELD_PARTNER_OVERRIDE ) continue;
 
-					$choices = isset($field['choices']) && is_array($field['choices']) ? $field['choices'] : [];
+				foreach ( $form['fields'] as &$field ) {
+
+					$fid = 0;
+					$choices = [];
+
+					if ( is_object($field) ) {
+						// GF_Field object (runtime)
+						$fid     = (int) ($field->id ?? 0);
+						$choices = is_array($field->choices ?? null) ? $field->choices : [];
+					} elseif ( is_array($field) ) {
+						// Array (exports / older contexts)
+						$fid     = (int) ($field['id'] ?? 0);
+						$choices = isset($field['choices']) && is_array($field['choices']) ? $field['choices'] : [];
+					} else {
+						continue;
+					}
+
+					if ( $fid !== self::GF_FIELD_PARTNER_OVERRIDE ) {
+						continue;
+					}
 
 					// Ensure placeholder is first choice
 					if ( empty($choices) || (string)($choices[0]['value'] ?? '___') !== '' ) {
@@ -251,13 +266,19 @@ final class Plugin {
 						];
 					}
 
-					$field['choices'] = $choices;
+					// Write back choices
+					if ( is_object($field) ) {
+						$field->choices = $choices;
+					} else {
+						$field['choices'] = $choices;
+					}
 
 					// Add inline JS to instantly fill hidden fields on change
 					$this->gf_register_partner_js_init( (int) $form['id'], $partners );
 
 					break;
 				}
+
 				unset($field);
 			}
 		}
