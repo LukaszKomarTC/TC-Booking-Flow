@@ -20,8 +20,10 @@ jobs:
           PLUGIN_SLUG="tc-booking-flow"
           BUILD_DIR="build"
 
+          echo "Building plugin zip..."
           mkdir -p "$BUILD_DIR/$PLUGIN_SLUG"
 
+          echo "Copying files to build directory..."
           rsync -av \
             --exclude ".git" \
             --exclude ".github" \
@@ -29,15 +31,42 @@ jobs:
             --exclude ".DS_Store" \
             ./ "$BUILD_DIR/$PLUGIN_SLUG/"
 
+          echo "Contents of build directory:"
+          ls -la "$BUILD_DIR/$PLUGIN_SLUG/"
+
           cd "$BUILD_DIR"
           zip -r "../latest.zip" "$PLUGIN_SLUG"
 
+          echo "Zip file created:"
+          ls -lh ../latest.zip
+          unzip -l ../latest.zip | head -20
+
       - name: Create latest.json
+        env:
+          DOWNLOAD_URL: ${{ secrets.DOWNLOAD_URL }}
         run: |
           set -e
+
+          # Extract version from main plugin file
+          VERSION=$(grep -oP "Version:\s*\K[\d\.]+" tc-booking-flow.php)
           COMMIT="$(git rev-parse --short HEAD)"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          printf '{"commit":"%s","built_at":"%s"}\n' "$COMMIT" "$DATE" > latest.json
+
+          echo "Creating latest.json with version $VERSION"
+
+          # Create JSON with WordPress plugin update checker format
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "download_url": "$DOWNLOAD_URL",
+            "requires": "5.0",
+            "tested": "6.4",
+            "last_updated": "$DATE",
+            "commit": "$COMMIT"
+          }
+          EOF
+
+          cat latest.json
 
       - name: Install SFTP tools
         run: |
