@@ -1,3 +1,44 @@
+name: Publish latest plugin ZIP (SFTP)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    environment: TCBF
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build latest.zip
+        run: |
+          set -e
+          PLUGIN_SLUG="tc-booking-flow"
+          BUILD_DIR="build"
+
+          mkdir -p "$BUILD_DIR/$PLUGIN_SLUG"
+
+          rsync -av \
+            --exclude ".git" \
+            --exclude ".github" \
+            --exclude "$BUILD_DIR" \
+            --exclude ".DS_Store" \
+            ./ "$BUILD_DIR/$PLUGIN_SLUG/"
+
+          cd "$BUILD_DIR"
+          zip -r "../latest.zip" "$PLUGIN_SLUG"
+
+      - name: Create latest.json
+        run: |
+          set -e
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{"commit":"%s","built_at":"%s"}\n' "$COMMIT" "$DATE" > latest.json
+
       - name: Probe SFTP root (no shell)
         env:
           SFTP_HOST_RAW: ${{ secrets.FTP_SERVER }}
@@ -14,7 +55,6 @@
           cat > sftp-probe.txt <<'EOF'
           pwd
           ls
-          ls staging
           bye
           EOF
 
