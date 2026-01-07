@@ -97,6 +97,9 @@ jobs:
             -not -path "./build/*" \
             -not -name ".DS_Store" \
             -not -name "plugin-full.txt" \
+            -not -name "latest.zip" \
+            -not -name "latest.json" \
+            -not -name ".htaccess" \
             | sort | sed 's|^\./||' >> plugin-full.txt
 
           echo "" >> plugin-full.txt
