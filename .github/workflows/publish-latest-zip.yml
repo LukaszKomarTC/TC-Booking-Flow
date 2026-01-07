@@ -101,6 +101,8 @@ jobs:
           cat >> sftp-batch.txt <<EOF
           put latest.zip
           put latest.json
+          pwd
+          ls -la
           bye
           EOF
 
