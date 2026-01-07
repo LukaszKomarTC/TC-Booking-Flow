@@ -31,30 +31,11 @@ jobs:
             --exclude ".DS_Store" \
             ./ "$BUILD_DIR/$PLUGIN_SLUG/"
 
-          echo "Contents of build directory:"
-          ls -la "$BUILD_DIR/$PLUGIN_SLUG/"
-
-          echo "Verifying main plugin file was copied:"
-          ls -lh "$BUILD_DIR/$PLUGIN_SLUG/tc-booking-flow.php"
-          head -5 "$BUILD_DIR/$PLUGIN_SLUG/tc-booking-flow.php"
-
-          echo "File count in build directory:"
-          find "$BUILD_DIR/$PLUGIN_SLUG" -type f | wc -l
-
           cd "$BUILD_DIR"
           zip -r "../latest.zip" "$PLUGIN_SLUG"
 
-          echo "Zip file created:"
-          ls -lh ../latest.zip
-
-          echo "Zip contents (first 30 entries):"
-          unzip -l ../latest.zip | head -30
-
-          echo "Verifying zip integrity:"
-          unzip -t ../latest.zip
-
-          echo "Checking main plugin file in zip:"
-          unzip -p ../latest.zip "$PLUGIN_SLUG/tc-booking-flow.php" | head -10
+          echo "Zip file created: $(ls -lh ../latest.zip | awk '{print $5}')"
+          echo "File count: $(find "$PLUGIN_SLUG" -type f | wc -l) files"
 
       - name: Create latest.json
         run: |
@@ -126,13 +107,16 @@ jobs:
           echo "================================================================================" >> plugin-full.txt
           echo "" >> plugin-full.txt
 
-          # Include all PHP files and important config files
-          find . -type f \( -name "*.php" -o -name "*.txt" -o -name "*.json" -o -name "*.md" \) \
+          # Include all plugin files except plugin-update-checker library
+          find . -type f \
             -not -path "./.git/*" \
             -not -path "./.github/*" \
             -not -path "./build/*" \
             -not -path "./plugin-update-checker/*" \
+            -not -name ".DS_Store" \
             -not -name "plugin-full.txt" \
+            -not -name ".htaccess" \
+            -not -name "latest.json" \
             | sort | while read file; do
               echo "==== FILE: ${file#./} ====" >> plugin-full.txt
               cat "$file" >> plugin-full.txt
