@@ -19,6 +19,14 @@ final class Plugin {
 	// Coupon / partner code (your form uses field 154 as "partner code" input)
 	const GF_FIELD_COUPON_CODE   = 154;
 
+
+	// Partner fields in GF44 (admin override + hidden fields)
+	const GF_FIELD_PARTNER_OVERRIDE = 63;  // admin-only select
+	const GF_FIELD_PARTNER_EMAIL    = 153; // hidden
+	const GF_FIELD_PARTNER_ID       = 166; // hidden
+	const GF_FIELD_PARTNER_COMM_PCT = 161; // hidden
+	const GF_FIELD_DISCOUNT_PCT     = 152; // hidden
+
 	// EB hidden field is 172 with inputName early_booking_discount_pct (dynamic population)
 	const GF_FIELD_EB_PCT        = 172;
 
@@ -80,6 +88,11 @@ final class Plugin {
 
 		// ---- GF: dynamic EB% population (field 172)
 		add_filter('gform_field_value_early_booking_discount_pct', [ $this, 'gf_populate_eb_pct' ]);
+
+		// ---- GF: partner override dropdown + populate partner hidden fields
+		add_filter('gform_pre_render',            [ $this, 'gf_partner_prepare_form' ], 9);
+		add_filter('gform_pre_validation',        [ $this, 'gf_partner_prepare_form' ], 9);
+		add_filter('gform_pre_submission_filter', [ $this, 'gf_partner_prepare_form' ], 9);
 
 		// ---- GF: server-side validation (tamper-proof + self-heal)
 		add_filter('gform_validation', [ $this, 'gf_validation' ], 10, 1);
@@ -169,6 +182,327 @@ final class Plugin {
 
 		$ok = $cart->add_discount( $code );
 		$this->log('partner.coupon.auto_apply', ['user_id'=>$user_id,'code'=>$code,'ok'=>$ok ? 1 : 0]);
+	}
+
+
+
+
+	/* =========================================================
+	 * GF: Partner override + partner fields population (GF44)
+	 * ========================================================= */
+
+	/**
+	 * GF: Build admin partner dropdown choices + populate partner hidden fields.
+	 *
+	 * Priority rules:
+	 * 1) Admin override (field 63)
+	 * 2) Logged-in partner/hotel user (role=hotel + discount__code user meta)
+	 * 3) Existing coupon code in GF field 154 (manual / legacy)
+	 *
+	 * This enables instant EB + partner discount visibility inside the GF form.
+	 */
+	public function gf_partner_prepare_form( $form ) {
+
+		// Guard: GF not active or form not array
+		if ( ! is_array($form) || empty($form['id']) ) return $form;
+
+		$target_form_id = class_exists('\\TC_BF\\Admin\\Settings') ? (int) \TC_BF\Admin\Settings::get_form_id() : self::GF_FORM_ID;
+		if ( (int) $form['id'] !== $target_form_id ) return $form;
+
+		if ( ! is_user_logged_in() ) return $form;
+
+		$user = wp_get_current_user();
+		if ( ! $user || empty($user->ID) ) return $form;
+
+		$is_admin = current_user_can('manage_options');
+		$is_hotel = in_array('hotel', (array) $user->roles, true);
+
+		// 1) Build dropdown for admin only (field 63)
+		$partners = [];
+		if ( $is_admin ) {
+
+			$partners = $this->get_partner_users_for_dropdown();
+
+			if ( ! empty($form['fields']) && is_array($form['fields']) ) {
+				foreach ( $form['fields'] as &$field ) {
+					if ( ! is_array($field) ) continue;
+					$fid = (int) ($field['id'] ?? 0);
+					if ( $fid !== self::GF_FIELD_PARTNER_OVERRIDE ) continue;
+
+					$choices = isset($field['choices']) && is_array($field['choices']) ? $field['choices'] : [];
+
+					// Ensure placeholder is first choice
+					if ( empty($choices) || (string)($choices[0]['value'] ?? '___') !== '' ) {
+						array_unshift($choices, [
+							'text' => '— Select partner —',
+							'value' => '',
+							'isSelected' => false,
+							'price' => '',
+						]);
+					}
+
+					// Append dynamic partners
+					foreach ( $partners as $p ) {
+						$choices[] = [
+							'text' => $p['label'],
+							'value' => (string) $p['id'], // store user ID
+							'isSelected' => false,
+							'price' => '',
+						];
+					}
+
+					$field['choices'] = $choices;
+
+					// Add inline JS to instantly fill hidden fields on change
+					$this->gf_register_partner_js_init( (int) $form['id'], $partners );
+
+					break;
+				}
+				unset($field);
+			}
+		}
+
+		// 2) Resolve partner context (priority rules)
+		$ctx = $this->gf_resolve_partner_context( $is_admin, $is_hotel );
+
+		// 3) Apply context into POST so GF calculations can use it
+		// (GF expects input_<field_id> keys)
+		if ( $ctx['partner_id'] > 0 ) {
+
+			$_POST['input_' . self::GF_FIELD_PARTNER_ID]       = (string) $ctx['partner_id'];
+			$_POST['input_' . self::GF_FIELD_PARTNER_EMAIL]    = (string) $ctx['partner_email'];
+			$_POST['input_' . self::GF_FIELD_PARTNER_COMM_PCT] = (string) wc_format_decimal((float) $ctx['commission_pct'], 2);
+			$_POST['input_' . self::GF_FIELD_COUPON_CODE]      = (string) $ctx['coupon_code'];
+			$_POST['input_' . self::GF_FIELD_DISCOUNT_PCT]     = (string) wc_format_decimal((float) $ctx['discount_pct'], 2);
+
+			$this->log('gf.partner.ctx', [
+				'source' => $ctx['source'],
+				'partner_id' => $ctx['partner_id'],
+				'coupon' => $ctx['coupon_code'],
+				'discount_pct' => $ctx['discount_pct'],
+				'commission_pct' => $ctx['commission_pct'],
+			]);
+
+		} else {
+			// If admin cleared override and user isn't a partner, ensure we don't keep stale partner values.
+			if ( $is_admin || ! $is_hotel ) {
+				$_POST['input_' . self::GF_FIELD_PARTNER_ID]       = '';
+				$_POST['input_' . self::GF_FIELD_PARTNER_EMAIL]    = '';
+				$_POST['input_' . self::GF_FIELD_PARTNER_COMM_PCT] = '';
+				$_POST['input_' . self::GF_FIELD_DISCOUNT_PCT]     = '';
+				// Do NOT wipe coupon code (154) if it was manually provided; resolver already handles it.
+			}
+		}
+
+		return $form;
+	}
+
+	/**
+	 * Return partner users list for admin dropdown.
+	 *
+	 * Partner definition (legacy parity):
+	 * - has user meta discount__code (coupon code)
+	 * Optional: role=hotel is a hint but discount__code is the real source.
+	 */
+	private function get_partner_users_for_dropdown() : array {
+
+		$users = get_users([
+			'fields' => ['ID','display_name','user_email'],
+			'meta_query' => [
+				[
+					'key' => 'discount__code',
+					'compare' => 'EXISTS',
+				],
+			],
+			'number' => 500,
+			'orderby' => 'display_name',
+			'order' => 'ASC',
+		]);
+
+		$out = [];
+		foreach ( $users as $u ) {
+			$uid = (int) $u->ID;
+
+			$code_raw = trim((string) get_user_meta($uid, 'discount__code', true));
+			if ( $code_raw === '' ) continue;
+
+			$code = function_exists('wc_format_coupon_code') ? wc_format_coupon_code($code_raw) : strtolower($code_raw);
+
+			$out[] = [
+				'id' => $uid,
+				'email' => (string) $u->user_email,
+				'display' => (string) $u->display_name,
+				'code' => $code,
+				'commission_pct' => (float) get_user_meta($uid, 'usrdiscount', true),
+				'discount_pct' => $this->get_coupon_percent_amount($code),
+				'label' => sprintf('%s (%s)', (string) $u->display_name, $code),
+			];
+		}
+
+		return $out;
+	}
+
+	private function gf_resolve_partner_context( bool $is_admin, bool $is_hotel ) : array {
+
+		$ctx = [
+			'partner_id' => 0,
+			'partner_email' => '',
+			'coupon_code' => '',
+			'discount_pct' => 0.0,
+			'commission_pct' => 0.0,
+			'source' => 'none',
+		];
+
+		// 1) Admin override
+		if ( $is_admin ) {
+			$override = isset($_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE]) ? (int) $_POST['input_' . self::GF_FIELD_PARTNER_OVERRIDE] : 0;
+			if ( $override > 0 ) {
+				$ctx = $this->partner_ctx_from_user_id($override);
+				$ctx['source'] = 'admin_override';
+				return $ctx;
+			}
+		}
+
+		// 2) Logged-in hotel user
+		if ( $is_hotel ) {
+			$ctx = $this->partner_ctx_from_user_id( (int) get_current_user_id() );
+			$ctx['source'] = $ctx['partner_id'] > 0 ? 'hotel_user' : 'hotel_user_missing_code';
+			return $ctx;
+		}
+
+		// 3) Existing coupon code in GF field 154 (manual / legacy)
+		$code_raw = isset($_POST['input_' . self::GF_FIELD_COUPON_CODE]) ? trim((string) $_POST['input_' . self::GF_FIELD_COUPON_CODE]) : '';
+		if ( $code_raw !== '' ) {
+			$code = function_exists('wc_format_coupon_code') ? wc_format_coupon_code($code_raw) : strtolower($code_raw);
+			$ctx['coupon_code'] = $code;
+			$ctx['discount_pct'] = $this->get_coupon_percent_amount($code);
+			$ctx['source'] = 'manual_coupon';
+		}
+
+		return $ctx;
+	}
+
+	private function partner_ctx_from_user_id( int $uid ) : array {
+
+		$u = get_user_by('id', $uid);
+		if ( ! $u ) {
+			return [
+				'partner_id' => 0,
+				'partner_email' => '',
+				'coupon_code' => '',
+				'discount_pct' => 0.0,
+				'commission_pct' => 0.0,
+				'source' => 'invalid_user',
+			];
+		}
+
+		$code_raw = trim((string) get_user_meta($uid, 'discount__code', true));
+		if ( $code_raw === '' ) {
+			return [
+				'partner_id' => 0,
+				'partner_email' => '',
+				'coupon_code' => '',
+				'discount_pct' => 0.0,
+				'commission_pct' => 0.0,
+				'source' => 'missing_code',
+			];
+		}
+
+		$code = function_exists('wc_format_coupon_code') ? wc_format_coupon_code($code_raw) : strtolower($code_raw);
+
+		return [
+			'partner_id' => (int) $uid,
+			'partner_email' => (string) $u->user_email,
+			'coupon_code' => (string) $code,
+			'discount_pct' => $this->get_coupon_percent_amount($code),
+			'commission_pct' => (float) get_user_meta($uid, 'usrdiscount', true),
+			'source' => 'user_meta',
+		];
+	}
+
+	/**
+	 * Read coupon % for percent coupons. Returns 0 if not found or not percent type.
+	 */
+	private function get_coupon_percent_amount( string $code ) : float {
+
+		$code = trim($code);
+		if ( $code === '' ) return 0.0;
+		if ( ! class_exists('\\WC_Coupon') ) return 0.0;
+
+		try {
+			$c = new \WC_Coupon($code);
+			if ( ! $c || ! $c->get_id() ) return 0.0;
+
+			$type = (string) $c->get_discount_type();
+			if ( $type !== 'percent' ) return 0.0;
+
+			return (float) $c->get_amount();
+		} catch ( \Throwable $e ) {
+			return 0.0;
+		}
+	}
+
+	/**
+	 * Inline JS: for admin override dropdown (field 63),
+	 * instantly populate the hidden partner fields so GF calcs update immediately.
+	 */
+	private function gf_register_partner_js_init( int $form_id, array $partners ) : void {
+
+		if ( ! class_exists('\\GFFormDisplay') ) return;
+
+		$map = [];
+		foreach ( $partners as $p ) {
+			$map[(string)$p['id']] = [
+				'partner_id'      => (int) $p['id'],
+				'partner_email'   => (string) $p['email'],
+				'coupon_code'     => (string) $p['code'],
+				'discount_pct'    => (float) $p['discount_pct'],
+				'commission_pct'  => (float) $p['commission_pct'],
+			];
+		}
+
+		$json = wp_json_encode($map);
+
+		$override_id = 'input_' . $form_id . '_' . self::GF_FIELD_PARTNER_OVERRIDE;
+		$hid_partner_id = 'input_' . $form_id . '_' . self::GF_FIELD_PARTNER_ID;
+		$hid_partner_email = 'input_' . $form_id . '_' . self::GF_FIELD_PARTNER_EMAIL;
+		$hid_comm_pct = 'input_' . $form_id . '_' . self::GF_FIELD_PARTNER_COMM_PCT;
+		$hid_coupon = 'input_' . $form_id . '_' . self::GF_FIELD_COUPON_CODE;
+		$hid_disc_pct = 'input_' . $form_id . '_' . self::GF_FIELD_DISCOUNT_PCT;
+
+		$script = "(function($){\n"
+			. "  var map = {$json} || {};\n"
+			. "  function setVal(domId, v){\n"
+			. "    var el = document.getElementById(domId);\n"
+			. "    if(!el) return;\n"
+			. "    el.value = (v === null || typeof v === 'undefined') ? '' : v;\n"
+			. "    $(el).trigger('change');\n"
+			. "  }\n"
+			. "  function applyPartner(pid){\n"
+			. "    var p = map[String(pid)] || null;\n"
+			. "    if(!p){\n"
+			. "      setVal('{$hid_partner_id}', '');\n"
+			. "      setVal('{$hid_partner_email}', '');\n"
+			. "      setVal('{$hid_comm_pct}', '');\n"
+			. "      setVal('{$hid_coupon}', '');\n"
+			. "      setVal('{$hid_disc_pct}', '');\n"
+			. "      return;\n"
+			. "    }\n"
+			. "    setVal('{$hid_partner_id}', p.partner_id);\n"
+			. "    setVal('{$hid_partner_email}', p.partner_email);\n"
+			. "    setVal('{$hid_comm_pct}', p.commission_pct);\n"
+			. "    setVal('{$hid_coupon}', p.coupon_code);\n"
+			. "    setVal('{$hid_disc_pct}', p.discount_pct);\n"
+			. "  }\n"
+			. "  $(document).on('change', '#{$override_id}', function(){ applyPartner($(this).val()); });\n"
+			. "})(jQuery);";
+
+		\GFFormDisplay::add_init_script(
+			$form_id,
+			'tc_bf_partner_override_' . $form_id,
+			\GFFormDisplay::ON_PAGE_RENDER,
+			$script
+		);
 	}
 
 
