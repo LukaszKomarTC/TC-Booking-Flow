@@ -66,6 +66,9 @@ final class Plugin {
 	// GF partner dropdown JS payload (per request)
 	private $partner_js_payload = [];
 
+	// GF rental price fix JS payload (per request)
+	private $rental_js_payload = [];
+
 	public static function instance() : self {
 		if ( self::$instance === null ) self::$instance = new self();
 		return self::$instance;
@@ -93,6 +96,7 @@ final class Plugin {
 		add_filter('gform_pre_validation',         [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_filter('gform_pre_submission_filter',  [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_action('wp_footer',                    [ $this, 'gf_output_partner_js' ], 100);
+		add_action('wp_footer',                    [ $this, 'gf_output_rental_price_js' ], 110);
 
 
 		// ---- GF: submission to cart (single source of truth)
@@ -454,6 +458,11 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Also register an init script so this works even when GF renders via AJAX.
 		$this->gf_register_partner_init_script( $form_id, $partners, $initial_code );
 
+		// Rental price normalization (frontend): keep GF internal price inputs in dot-decimal,
+		// while showing decimal_comma to the user. This prevents the "30,00" => "3000,00" bug
+		// on hide/show (conditional logic) cycles.
+		$this->gf_register_rental_price_fix( $form_id );
+
 		return $form;
 	}
 
@@ -786,6 +795,146 @@ public function gf_output_partner_js() : void {
 			echo $js;
 			echo "\n</script>\n";
 		}
+	}
+
+	/**
+	 * Output rental price normalization JS for pages where GF is rendered.
+	 * This is a safety net in addition to GFFormDisplay::add_init_script, and also helps on
+	 * themes/builders that inject the form late.
+	 */
+	public function gf_output_rental_price_js() : void {
+		if ( empty( $this->rental_js_payload ) ) return;
+		if ( is_admin() ) return;
+
+		foreach ( $this->rental_js_payload as $form_id => $payload ) {
+			$form_id = (int) $form_id;
+			if ( $form_id <= 0 ) continue;
+			$prices = (is_array($payload) && isset($payload['prices']) && is_array($payload['prices'])) ? $payload['prices'] : [];
+			$js = $this->build_rental_price_fix_js( $form_id, $prices );
+			if ( $js === '' ) continue;
+			echo "\n<script id=\"tc-bf-rental-price-fix-{$form_id}\">\n";
+			echo $js;
+			echo "\n</script>\n";
+		}
+	}
+
+	/**
+	 * Register rental price fix (per form render).
+	 */
+	private function gf_register_rental_price_fix( int $form_id ) : void {
+		if ( $form_id <= 0 ) return;
+		if ( is_admin() ) return;
+		if ( ! is_singular('sc_event') ) return;
+
+		$event_id = (int) get_queried_object_id();
+		if ( $event_id <= 0 ) return;
+
+		// Pull per-event rental prices from meta (single source of truth).
+		$prices = [
+			'road'   => $this->money_to_float( get_post_meta($event_id, 'rental_price_road', true) ),
+			'mtb'    => $this->money_to_float( get_post_meta($event_id, 'rental_price_mtb', true) ),
+			'ebike'  => $this->money_to_float( get_post_meta($event_id, 'rental_price_ebike', true) ),
+			'gravel' => $this->money_to_float( get_post_meta($event_id, 'rental_price_gravel', true) ),
+		];
+
+		// Cache for footer output (safety net).
+		$this->rental_js_payload[ $form_id ] = [
+			'event_id' => $event_id,
+			'prices'   => $prices,
+		];
+
+		// Register init script (works for standard + AJAX GF renders).
+		if ( class_exists('\GFFormDisplay') ) {
+			$script = $this->build_rental_price_fix_js( $form_id, $prices );
+			if ( $script !== '' ) {
+				\GFFormDisplay::add_init_script(
+					$form_id,
+					'tc_bf_rental_price_fix_' . $form_id,
+					\GFFormDisplay::ON_PAGE_RENDER,
+					$script
+				);
+			}
+		}
+	}
+
+	/**
+	 * Build JS that keeps GF product price inputs in dot-decimal (internal GF format)
+	 * while showing decimal_comma to users.
+	 *
+	 * Fixes bug: after toggling rental (field 106) off/on, a price like "30,00" can be re-parsed
+	 * by GF as "3000" (comma stripped) when a field is hidden/shown.
+	 */
+	private function build_rental_price_fix_js( int $form_id, array $prices ) : string {
+		$form_id = (int) $form_id;
+		if ( $form_id <= 0 ) return '';
+
+		// Ensure predictable floats.
+		$p_road   = (float) ($prices['road'] ?? 0);
+		$p_mtb    = (float) ($prices['mtb'] ?? 0);
+		$p_ebike  = (float) ($prices['ebike'] ?? 0);
+		$p_gravel = (float) ($prices['gravel'] ?? 0);
+
+		return "(function(){\n"
+			. "  var fid = {$form_id};\n"
+			. "  var PRICE = {road:" . $this->float_to_str($p_road) . ", mtb:" . $this->float_to_str($p_mtb) . ", ebike:" . $this->float_to_str($p_ebike) . ", gravel:" . $this->float_to_str($p_gravel) . "};\n"
+			. "  var MAP = {ROAD:139, MTB:140, EMTB:141, 'E-MTB':141, 'E MTB':141, GRAVEL:171};\n"
+			. "  function qs(sel,root){ return (root||document).querySelector(sel); }\n"
+			. "  function qsa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }\n"
+			. "  function getSelVal(){\n"
+			. "    var el = qs('#input_'+fid+'_106');\n"
+			. "    var v = el ? (el.value||'').toString().trim() : '';\n"
+			. "    if(!v) return '';\n"
+			. "    v = v.toUpperCase();\n"
+			. "    if(v==='EMTB') return 'EMTB';\n"
+			. "    if(v==='E-MTB' || v==='E MTB') return 'E-MTB';\n"
+			. "    return v;\n"
+			. "  }\n"
+			. "  function toDot2(n){ n = (typeof n==='number')?n:parseFloat(String(n).replace(',','.')); if(isNaN(n)) n=0; return n.toFixed(2); }\n"
+			. "  function toComma2(n){ n = (typeof n==='number')?n:parseFloat(String(n).replace(',','.')); if(isNaN(n)) n=0; return n.toFixed(2).replace('.', ','); }\n"
+			. "  function dispatchChange(el){ if(!el) return; try{ el.dispatchEvent(new Event('change',{bubbles:true})); }catch(e){} }\n"
+			. "  function setProductPrice(fieldId, amount){\n"
+			. "    // Internal GF price input (MUST be dot-decimal)\n"
+			. "    var input = document.getElementById('input_'+fid+'_'+fieldId+'_2') || qs('input[name=\"input_'+fieldId+'.2\"]');\n"
+			. "    if(input){ input.value = toDot2(amount); dispatchChange(input); }\n"
+			. "    // Visual price labels (MUST be decimal_comma)\n"
+			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
+			. "    if(wrap){\n"
+			. "      var txt = toComma2(amount) + ' €';\n"
+			. "      qsa('.ginput_product_price, .ginput_product_price_label, .ginput_product_price_wrapper .ginput_product_price', wrap).forEach(function(s){\n"
+			. "        if(s) s.textContent = txt;\n"
+			. "      });\n"
+			. "    }\n"
+			. "  }\n"
+			. "  function apply(){\n"
+			. "    var v = getSelVal();\n"
+			. "    // Always normalize all rental product price inputs (prevents stale/shifted values).\n"
+			. "    setProductPrice(139, (v==='ROAD') ? (PRICE.road||0) : 0);\n"
+			. "    setProductPrice(140, (v==='MTB') ? (PRICE.mtb||0) : 0);\n"
+			. "    setProductPrice(141, (v==='EMTB' || v==='E-MTB') ? (PRICE.ebike||0) : 0);\n"
+			. "    setProductPrice(171, (v==='GRAVEL') ? (PRICE.gravel||0) : 0);\n"
+			. "    if(typeof window.gformCalculateTotalPrice === 'function'){\n"
+			. "      try{ window.gformCalculateTotalPrice(fid); }catch(e){}\n"
+			. "    }\n"
+			. "  }\n"
+			. "  function bind(){\n"
+			. "    var el = qs('#input_'+fid+'_106');\n"
+			. "    if(el && !el.__tcBfRentalBound){\n"
+			. "      el.__tcBfRentalBound = true;\n"
+			. "      el.addEventListener('change', function(){ setTimeout(apply, 0); });\n"
+			. "    }\n"
+			. "    // Initial apply (and re-apply after conditional logic runs).\n"
+			. "    apply();\n"
+			. "    return true;\n"
+			. "  }\n"
+			. "  var tries=0;\n"
+			. "  (function loop(){ if(bind()) return; tries++; if(tries<20) setTimeout(loop, 250); })();\n"
+			. "  if(window.MutationObserver){\n"
+			. "    try{ var mo=new MutationObserver(function(){ apply(); }); mo.observe(document.body,{childList:true,subtree:true}); }catch(e){}\n"
+			. "  }\n"
+			. "  if(window.jQuery){\n"
+			. "    try{ jQuery(document).on('gform_post_render', function(e, id){ if(parseInt(id,10)===fid) apply(); }); }catch(e){}\n"
+			. "  }\n"
+			. "})();\n";
 	}
 
 	private function float_to_str( float $v ) : string {
