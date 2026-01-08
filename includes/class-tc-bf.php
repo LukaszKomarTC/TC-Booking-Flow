@@ -1214,6 +1214,112 @@ private function is_valid_participation_product( int $product_id ) : bool {
  * Find participation product by matching any sc_event_category slug against product meta.
  * Meta key: tc_participation_category_key (set on the product).
  */
+
+/* =========================================================
+ * WooCommerce / Bookings glue (missing in latest.zip)
+ * ========================================================= */
+
+/**
+ * Ensure cart item prices follow our snapshot cost.
+ * This prevents Woo Bookings / Woo from falling back to product base price (e.g. 1000€ rental).
+ */
+public function woo_apply_eb_snapshot_to_cart( $cart ) {
+	if ( ! $cart || ! is_object($cart) || ( is_admin() && ! defined('DOING_AJAX') ) ) return;
+
+	foreach ( $cart->get_cart() as $cart_item_key => &$cart_item ) {
+		if ( empty($cart_item['booking']) || ! is_array($cart_item['booking']) ) continue;
+
+		$custom = $cart_item['booking'][ self::BK_CUSTOM_COST ] ?? '';
+		if ( $custom === '' ) continue;
+
+		$custom = (float) wc_format_decimal( (float) $custom, 2 );
+
+		if ( isset($cart_item['data']) && is_object($cart_item['data']) && method_exists($cart_item['data'], 'set_price') ) {
+			$cart_item['data']->set_price( $custom );
+		}
+	}
+}
+
+/**
+ * Woo Bookings hook - safety net if booking meta is available.
+ */
+public function woo_override_booking_cost( $calculated_cost, $booking, $product ) {
+	try {
+		if ( is_object($booking) && method_exists($booking, 'get_meta') ) {
+			$v = $booking->get_meta( self::BK_CUSTOM_COST, true );
+			if ( $v !== '' ) return (float) $v;
+		}
+	} catch ( \Throwable $e ) {}
+	return $calculated_cost;
+}
+
+/**
+ * Display basic meta in cart.
+ */
+public function woo_cart_item_data( $item_data, $cart_item ) {
+	if ( ! is_array($item_data) ) $item_data = [];
+
+	if ( ! empty($cart_item['tc_scope']) ) {
+		$item_data[] = [
+			'name'  => 'Scope',
+			'value' => esc_html( (string) $cart_item['tc_scope'] ),
+		];
+	}
+
+	if ( ! empty($cart_item['tc_partner']['coupon_code']) ) {
+		$item_data[] = [
+			'name'  => 'Partner',
+			'value' => esc_html( (string) $cart_item['tc_partner']['coupon_code'] ),
+		];
+	}
+
+	return $item_data;
+}
+
+/**
+ * Persist our meta to order items.
+ */
+public function woo_checkout_create_order_line_item( $item, $cart_item_key, $values, $order ) {
+	if ( ! $item || ! is_object($item) ) return;
+
+	if ( ! empty($values['booking']) && is_array($values['booking']) ) {
+		$b = $values['booking'];
+		if ( isset($b['event_id']) )   $item->add_meta_data('_event_id', (int) $b['event_id'], true);
+		if ( isset($b['event_slug']) ) $item->add_meta_data('_event_slug', (string) $b['event_slug'], true);
+		if ( isset($b[self::BK_CUSTOM_COST]) ) $item->add_meta_data(self::BK_CUSTOM_COST, (string) $b[self::BK_CUSTOM_COST], true);
+	}
+
+	if ( isset($values['tc_group_id']) ) $item->add_meta_data('tc_group_id', (string) $values['tc_group_id'], true);
+	if ( isset($values['tc_scope']) )    $item->add_meta_data('tc_scope', (string) $values['tc_scope'], true);
+
+	if ( ! empty($values['tc_partner']) && is_array($values['tc_partner']) ) {
+		foreach ( $values['tc_partner'] as $k => $v ) {
+			$item->add_meta_data('tc_partner_' . $k, is_scalar($v) ? (string) $v : wp_json_encode($v), true);
+		}
+	}
+}
+
+/**
+ * Persist partner meta on the order.
+ */
+public function partner_persist_order_meta( $order, $data ) {
+	if ( ! $order || ! is_a($order, 'WC_Order') ) return;
+
+	// First found partner on any line item wins.
+	foreach ( $order->get_items() as $item ) {
+		$code = $item->get_meta('tc_partner_coupon_code', true);
+		if ( ! $code ) continue;
+
+		$order->update_meta_data('tc_partner_coupon_code', (string) $code);
+		$order->update_meta_data('tc_partner_id', (int) $item->get_meta('tc_partner_partner_id', true));
+		$order->update_meta_data('tc_partner_email', (string) $item->get_meta('tc_partner_partner_email', true));
+		$order->update_meta_data('tc_partner_discount_pct', (float) $item->get_meta('tc_partner_discount_pct', true));
+		$order->update_meta_data('tc_partner_commission_pct', (float) $item->get_meta('tc_partner_commission_pct', true));
+		break;
+	}
+}
+
+
 private function find_participation_product_by_category_slugs( array $slugs ) : int {
 
 	$slugs = array_values(array_filter(array_map(function($s){
