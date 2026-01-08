@@ -640,45 +640,158 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 			$form_id = (int) $form_id;
 			if ( $form_id <= 0 ) continue;
 
+			// Map: { code => {id,email,commission,discount} }
 			$json = wp_json_encode($partners);
 
-			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
-			echo "window.tcBfPartnerMap = window.tcBfPartnerMap || {};\n";
-			echo "window.tcBfPartnerMap[{$form_id}] = {$json};\n";
-			echo "(function($){\n";
-			echo "  function tcBfApplyPartner(fid){\n";
-			echo "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n";
-			echo "    var $sel = $('#input_'+fid+'_63');\n";
-			echo "    if(!$sel.length) return;\n";
-			echo "    var code = ($sel.val()||'').toString().trim();\n";
-			echo "    var data = code && map[code] ? map[code] : null;\n";
-			echo "    var setVal = function(fieldId,val){ var $i=$('#input_'+fid+'_'+fieldId); if(!$i.length) return; $i.val(val); $i.trigger('change'); };\n";
-			echo "    if(!data){\n";
-			echo "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n";
-			echo "    } else {\n";
-			echo "      setVal(154,code);\n";
-			echo "      setVal(152,(data.discount||''));\n";
-			echo "      setVal(161,(data.commission||''));\n";
-			echo "      setVal(153,(data.email||''));\n";
-			echo "      setVal(166,(data.id||''));\n";
-			echo "    }\n";
-			echo "    var showField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.show(); $f.attr('data-conditional-logic','visible'); } var $i=$('#input_'+fid+'_'+fieldId); if($i.length){ $i.prop('disabled',false); } };\n";
-			echo "    var hideField = function(fieldId){ var $f=$('#field_'+fid+'_'+fieldId); if($f.length){ $f.hide(); $f.attr('data-conditional-logic','hidden'); } };\n";
-			echo "    if(data && code){ showField(176); showField(164); showField(168); showField(165); } else { hideField(176); hideField(165); }\n";
-			echo "    var $wrap = $('#field_'+fid+'_177 .tc-bf-price-summary');\n";
-			echo "    if($wrap.length){\n";
-			echo "      var ebPct = parseFloat($('#input_'+fid+'_172').val()||0)||0;\n";
-			echo "      $wrap.find('.tc-bf-eb-line').toggle(ebPct>0);\n";
-			echo "      $wrap.find('.tc-bf-partner-line').toggle(!!(data && code));\n";
-			echo "      var comm = parseFloat($('#input_'+fid+'_161').val()||0)||0;\n";
-			echo "      $wrap.find('.tc-bf-commission').toggle(comm>0 && !!(data && code));\n";
-			echo "    }\n";
-			echo "    if(typeof window.gformCalculateTotalPrice === 'function'){ try{ window.gformCalculateTotalPrice(fid); }catch(e){} }\n";
-			echo "  }\n";
-			echo "  $(document).on('gform_post_render', function(e,fid){ if(parseInt(fid,10)==={$form_id}){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); }});\n";
-			echo "  $(function(){ tcBfApplyPartner({$form_id}); $('#input_'+{$form_id}+'_63').off('change.tcBf').on('change.tcBf', function(){ tcBfApplyPartner({$form_id}); }); });\n";
-			echo "})(jQuery);\n";
-			echo "</script>\n";
+			echo "
+<script id=\"tc-bf-partner-override-{$form_id}\">
+";
+			echo "window.tcBfPartnerMap = window.tcBfPartnerMap || {};
+";
+			echo "window.tcBfPartnerMap[{$form_id}] = {$json};
+";
+			echo "(function(){
+";
+			echo "  var fid = {$form_id};
+";
+			echo "  function qs(sel,root){ return (root||document).querySelector(sel); }
+";
+			echo "  function qsa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }
+";
+			echo "  function setVal(fieldId, val){
+";
+			echo "    var el = qs('#input_'+fid+'_'+fieldId);
+";
+			echo "    if(!el) return;
+";
+			echo "    el.value = (val===null||typeof val==='undefined') ? '' : String(val);
+";
+			echo "    try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}
+";
+			echo "  }
+";
+			echo "  function showField(fieldId){
+";
+			echo "    var wrap = qs('#field_'+fid+'_'+fieldId);
+";
+			echo "    if(wrap){ wrap.style.display=''; wrap.setAttribute('data-conditional-logic','visible'); }
+";
+			echo "    var el = qs('#input_'+fid+'_'+fieldId);
+";
+			echo "    if(el){ el.disabled=false; }
+";
+			echo "  }
+";
+			echo "  function hideField(fieldId){
+";
+			echo "    var wrap = qs('#field_'+fid+'_'+fieldId);
+";
+			echo "    if(wrap){ wrap.style.display='none'; wrap.setAttribute('data-conditional-logic','hidden'); }
+";
+			echo "  }
+";
+			echo "  function applyPartner(){
+";
+			echo "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};
+";
+			echo "    var sel = qs('#input_'+fid+'_63');
+";
+			echo "    if(!sel) return;
+";
+			echo "    var code = (sel.value||'').toString().trim();
+";
+			echo "    var data = (code && map && map[code]) ? map[code] : null;
+";
+			echo "    if(!data){
+";
+			echo "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');
+";
+			echo "      hideField(176); hideField(165);
+";
+			echo "    } else {
+";
+			echo "      setVal(154,code);
+";
+			echo "      setVal(152,(data.discount||''));
+";
+			echo "      setVal(161,(data.commission||''));
+";
+			echo "      setVal(153,(data.email||''));
+";
+			echo "      setVal(166,(data.id||''));
+";
+			echo "      showField(176); showField(165);
+";
+			echo "    }
+";
+			echo "    // Toggle breakdown in the HTML block (field 177)
+";
+			echo "    var summary = qs('#field_'+fid+'_177 .tc-bf-price-summary');
+";
+			echo "    if(summary){
+";
+			echo "      var ebPct = parseFloat((qs('#input_'+fid+'_172')||{}).value||0)||0;
+";
+			echo "      var ebLine = qs('.tc-bf-eb-line', summary);
+";
+			echo "      if(ebLine) ebLine.style.display = (ebPct>0) ? '' : 'none';
+";
+			echo "      var pLine = qs('.tc-bf-partner-line', summary);
+";
+			echo "      if(pLine) pLine.style.display = (data && code) ? '' : 'none';
+";
+			echo "      var commPct = parseFloat((qs('#input_'+fid+'_161')||{}).value||0)||0;
+";
+			echo "      var cLine = qs('.tc-bf-commission', summary);
+";
+			echo "      if(cLine) cLine.style.display = (commPct>0 && data && code) ? '' : 'none';
+";
+			echo "    }
+";
+			echo "    // Ask GF to recalc totals if available
+";
+			echo "    if(typeof window.gformCalculateTotalPrice === 'function'){
+";
+			echo "      try{ window.gformCalculateTotalPrice(fid); }catch(e){}
+";
+			echo "    }
+";
+			echo "  }
+";
+			echo "  function bind(){
+";
+			echo "    var sel = qs('#input_'+fid+'_63');
+";
+			echo "    if(!sel) return;
+";
+			echo "    if(sel.__tcBfBound) return;
+";
+			echo "    sel.__tcBfBound = true;
+";
+			echo "    sel.addEventListener('change', applyPartner);
+";
+			echo "    applyPartner();
+";
+			echo "  }
+";
+			echo "  // GF triggers gform_post_render in many setups; but we also bind on DOM ready.
+";
+			echo "  document.addEventListener('DOMContentLoaded', bind);
+";
+			echo "  if(window.gform && typeof window.gform.addAction === 'function'){
+";
+			echo "    try{ window.gform.addAction('gform_post_render', function(e, formId){ if(parseInt(formId,10)===fid){ bind(); } }); }catch(e){}
+";
+			echo "  }
+";
+			echo "  // Fallback: attempt bind shortly after load.
+";
+			echo "  setTimeout(bind, 400);
+";
+			echo "})();
+";
+			echo "</script>
+";
 		}
 	}
 
