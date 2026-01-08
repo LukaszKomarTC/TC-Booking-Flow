@@ -1112,13 +1112,13 @@ public function gf_output_partner_js() : void {
 			if ( $eb_total_amt > 0 ) {
 				// Proportional distribution with rounding.
 				if ( isset($eligible_bases['part']) && $eligible_bases['part'] > 0 ) {
-					$eb_amt_part = round($eb_total_amt * ($eligible_bases['part'] / $eligible_sum), 2);
+					$eb_amt_part = $this->money_round($eb_total_amt * ($eligible_bases['part'] / $eligible_sum));
 				}
 				if ( isset($eligible_bases['rental']) && $eligible_bases['rental'] > 0 ) {
-					$eb_amt_rental = round($eb_total_amt * ($eligible_bases['rental'] / $eligible_sum), 2);
+					$eb_amt_rental = $this->money_round($eb_total_amt * ($eligible_bases['rental'] / $eligible_sum));
 				}
 				// Fix rounding drift on last eligible line.
-				$drift = round($eb_total_amt - ($eb_amt_part + $eb_amt_rental), 2);
+				$drift = $this->money_round($eb_total_amt - ($eb_amt_part + $eb_amt_rental));
 				if ( abs($drift) > 0.0001 ) {
 					if ( isset($eligible_bases['rental']) ) {
 						$eb_amt_rental = max(0.0, $eb_amt_rental + $drift);
@@ -1479,9 +1479,11 @@ public function gf_output_partner_js() : void {
 			}
 
 			if ( $amt > 0 ) {
-				$new = round( $base - $amt, 2 );
+				$disc = $this->money_round($amt);
+				$new  = $this->money_round($base - $disc);
 			} else {
-				$new = round( $base * (1 - ($pct/100)), 2 );
+				$disc = $this->money_round($base * ($pct/100));
+				$new  = $this->money_round($base - $disc);
 			}
 			if ( $new < 0 ) $new = 0;
 
