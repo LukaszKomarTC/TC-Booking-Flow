@@ -893,6 +893,8 @@ public function gf_output_partner_js() : void {
 		if ( $event_id <= 0 || get_post_type($event_id) !== 'sc_event' ) return $form;
 
 		// Read configured rental prices from event meta.
+		// IMPORTANT: we will inject these into GF *product* fields (basePrice + price input default)
+		// in a parse-safe format to prevent "30,00" becoming "3000,00" after conditional toggles.
 		$prices = [
 			'road'   => $this->money_to_float( get_post_meta( $event_id, 'rental_price_road', true ) ),
 			'mtb'    => $this->money_to_float( get_post_meta( $event_id, 'rental_price_mtb', true ) ),
@@ -909,6 +911,16 @@ public function gf_output_partner_js() : void {
 
 		if ( empty($form['fields']) || ! is_array($form['fields']) ) return $form;
 
+		// GF ID48 uses fixed product field IDs for rental lines:
+		// 139 = Road, 140 = MTB, 141 = eMTB, 171 = Gravel.
+		// Use explicit IDs (most robust) instead of label matching.
+		$field_id_to_bucket = [
+			139 => 'road',
+			140 => 'mtb',
+			141 => 'ebike',
+			171 => 'gravel',
+		];
+
 		foreach ( $form['fields'] as &$field ) {
 
 			// GF fields are objects.
@@ -917,28 +929,9 @@ public function gf_output_partner_js() : void {
 			$type = isset($field->type) ? (string) $field->type : '';
 			if ( $type !== 'product' ) continue;
 
-			// Identify rental product fields by label/adminLabel/cssClass.
-			$hay = strtolower(
-				(string) ($field->label ?? '') . ' ' .
-				(string) ($field->adminLabel ?? '') . ' ' .
-				(string) ($field->cssClass ?? '')
-			);
-
-			// Must look like a bike rental line; avoid touching participation product.
-			if ( strpos($hay, 'alquiler') === false && strpos($hay, 'rental') === false ) continue;
-
-			$bucket = '';
-			if ( strpos($hay, 'emtb') !== false || strpos($hay, 'e-mtb') !== false || strpos($hay, 'e mtb') !== false || strpos($hay, 'ebike') !== false || strpos($hay, 'e-bike') !== false ) {
-				$bucket = 'ebike';
-			} elseif ( strpos($hay, 'gravel') !== false ) {
-				$bucket = 'gravel';
-			} elseif ( strpos($hay, 'road') !== false || strpos($hay, 'carretera') !== false ) {
-				$bucket = 'road';
-			} elseif ( strpos($hay, 'mtb') !== false || strpos($hay, 'btt') !== false ) {
-				$bucket = 'mtb';
-			}
-
-			if ( $bucket === '' ) continue;
+			$fid = isset($field->id) ? (int) $field->id : 0;
+			if ( $fid <= 0 || ! isset($field_id_to_bucket[$fid]) ) continue;
+			$bucket = $field_id_to_bucket[$fid];
 
 			$price = isset($prices[$bucket]) ? (float) $prices[$bucket] : 0.0;
 
@@ -946,7 +939,21 @@ public function gf_output_partner_js() : void {
 			if ( $price <= 0 ) continue;
 
 			// Set base price in a parse-safe numeric format (dot decimal, no currency).
-			$field->basePrice = number_format( $price, 2, '.', '' );
+			$normalized = number_format( $price, 2, '.', '' );
+			$field->basePrice = $normalized;
+
+			// ALSO set the "Price" input default value (the one ending with .2)
+			// so conditional logic show/hide doesn't reintroduce a formatted value like "30,00 €".
+			if ( isset($field->inputs) && is_array($field->inputs) ) {
+				foreach ( $field->inputs as &$inp ) {
+					if ( ! is_array($inp) ) continue;
+					if ( empty($inp['id']) ) continue;
+					// Price input is always X.2 for product fields.
+					if ( substr((string)$inp['id'], -2) === '.2' ) {
+						$inp['defaultValue'] = $normalized;
+					}
+				}
+			}
 		}
 
 		return $form;
