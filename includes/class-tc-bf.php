@@ -444,6 +444,9 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		// Cache payload for footer output.
 		$this->partner_js_payload[ $form_id ] = $partners;
 
+		// Also register an init script so this works even when GF renders via AJAX.
+		$this->gf_register_partner_init_script( $form_id, $partners );
+
 		return $form;
 	}
 
@@ -631,167 +634,126 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		return $map;
 	}
 
-	public function gf_output_partner_js() : void {
+	
+	private function gf_register_partner_init_script( int $form_id, array $partners ) : void {
+		if ( $form_id <= 0 ) return;
+		if ( ! class_exists('\GFFormDisplay') ) return;
 
-		if ( empty($this->partner_js_payload) ) return;
+		$script = $this->build_partner_override_js( $form_id, $partners );
+		if ( $script === '' ) return;
+
+		// Runs reliably for normal and AJAX-rendered forms.
+		\GFFormDisplay::add_init_script(
+			$form_id,
+			'tc_bf_partner_override_' . $form_id,
+			\GFFormDisplay::ON_PAGE_RENDER,
+			$script
+		);
+	}
+
+	private function build_partner_override_js( int $form_id, array $partners ) : string {
+
+		// Map: { code => {id,email,commission,discount} }
+		$json = wp_json_encode( $partners );
+
+		// IMPORTANT: this is raw JS (no <script> wrapper). GF will wrap it.
+		return "window.tcBfPartnerMap = window.tcBfPartnerMap || {};\n"
+			. "window.tcBfPartnerMap[{$form_id}] = {$json};\n"
+			. "(function(){\n"
+			. "  var fid = {$form_id};\n"
+			. "  function qs(sel,root){ return (root||document).querySelector(sel); }\n"
+			. "  function setVal(fieldId, val){\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(!el) return;\n"
+			. "    el.value = (val===null||typeof val==='undefined') ? '' : String(val);\n"
+			. "    try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}\n"
+			. "  }\n"
+			. "  function showField(fieldId){\n"
+			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
+			. "    if(wrap){ wrap.style.display=''; wrap.setAttribute('data-conditional-logic','visible'); }\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(el){ el.disabled=false; }\n"
+			. "  }\n"
+			. "  function hideField(fieldId){\n"
+			. "    var wrap = qs('#field_'+fid+'_'+fieldId);\n"
+			. "    if(wrap){ wrap.style.display='none'; wrap.setAttribute('data-conditional-logic','hidden'); }\n"
+			. "    var el = qs('#input_'+fid+'_'+fieldId);\n"
+			. "    if(el){ el.disabled=true; }\n"
+			. "  }\n"
+			. "  function toggleSummary(data, code){\n"
+			. "    var summary = qs('#field_'+fid+'_177 .tc-bf-price-summary');\n"
+			. "    if(!summary) return;\n"
+			. "    var ebPct = parseFloat((qs('#input_'+fid+'_172')||{}).value||0)||0;\n"
+			. "    var ebLine = qs('.tc-bf-eb-line', summary);\n"
+			. "    if(ebLine) ebLine.style.display = (ebPct>0) ? '' : 'none';\n"
+			. "    var pLine = qs('.tc-bf-partner-line', summary);\n"
+			. "    if(pLine) pLine.style.display = (data && code) ? '' : 'none';\n"
+			. "    var commPct = parseFloat((qs('#input_'+fid+'_161')||{}).value||0)||0;\n"
+			. "    var cLine = qs('.tc-bf-commission', summary);\n"
+			. "    if(cLine) cLine.style.display = (commPct>0 && data && code) ? '' : 'none';\n"
+			. "  }\n"
+			. "  function applyPartner(){\n"
+			. "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};\n"
+			. "    var sel = qs('#input_'+fid+'_63');\n"
+			. "    if(!sel) return;\n"
+			. "    var code = (sel.value||'').toString().trim();\n"
+			. "    var data = (code && map && map[code]) ? map[code] : null;\n"
+			. "    if(!data){\n"
+			. "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');\n"
+			. "      hideField(176); hideField(165);\n"
+			. "    } else {\n"
+			. "      setVal(154,code);\n"
+			. "      setVal(152,(data.discount||''));\n"
+			. "      setVal(161,(data.commission||''));\n"
+			. "      setVal(153,(data.email||''));\n"
+			. "      setVal(166,(data.id||''));\n"
+			. "      showField(176); showField(165);\n"
+			. "    }\n"
+			. "    toggleSummary(data, code);\n"
+			. "    if(typeof window.gformCalculateTotalPrice === 'function'){\n"
+			. "      try{ window.gformCalculateTotalPrice(fid); }catch(e){}\n"
+			. "    }\n"
+			. "  }\n"
+			. "  function bind(){\n"
+			. "    var sel = qs('#input_'+fid+'_63');\n"
+			. "    if(!sel) return false;\n"
+			. "    if(sel.__tcBfBound) return true;\n"
+			. "    sel.__tcBfBound = true;\n"
+			. "    sel.addEventListener('change', applyPartner);\n"
+			. "    applyPartner();\n"
+			. "    return true;\n"
+			. "  }\n"
+			. "  // Try now, then retry a few times.\n"
+			. "  var tries = 0;\n"
+			. "  (function loop(){\n"
+			. "    if(bind()) return;\n"
+			. "    tries++; if(tries<20) setTimeout(loop, 250);\n"
+			. "  })();\n"
+			. "  // Also watch for late DOM injection (popups, AJAX embeds).\n"
+			. "  if(window.MutationObserver){\n"
+			. "    try{\n"
+			. "      var mo = new MutationObserver(function(){ bind(); });\n"
+			. "      mo.observe(document.body, {childList:true, subtree:true});\n"
+			. "    }catch(e){}\n"
+			. "  }\n"
+			. "})();\n";
+	}
+
+public function gf_output_partner_js() : void {
+
+		if ( empty( $this->partner_js_payload ) ) return;
 		if ( is_admin() ) return;
 
 		foreach ( $this->partner_js_payload as $form_id => $partners ) {
 			$form_id = (int) $form_id;
 			if ( $form_id <= 0 ) continue;
 
-			// Map: { code => {id,email,commission,discount} }
-			$json = wp_json_encode($partners);
+			$js = $this->build_partner_override_js( $form_id, $partners );
+			if ( $js === '' ) continue;
 
-			echo "
-<script id=\"tc-bf-partner-override-{$form_id}\">
-";
-			echo "window.tcBfPartnerMap = window.tcBfPartnerMap || {};
-";
-			echo "window.tcBfPartnerMap[{$form_id}] = {$json};
-";
-			echo "(function(){
-";
-			echo "  var fid = {$form_id};
-";
-			echo "  function qs(sel,root){ return (root||document).querySelector(sel); }
-";
-			echo "  function qsa(sel,root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); }
-";
-			echo "  function setVal(fieldId, val){
-";
-			echo "    var el = qs('#input_'+fid+'_'+fieldId);
-";
-			echo "    if(!el) return;
-";
-			echo "    el.value = (val===null||typeof val==='undefined') ? '' : String(val);
-";
-			echo "    try{ el.dispatchEvent(new Event('change', {bubbles:true})); }catch(e){}
-";
-			echo "  }
-";
-			echo "  function showField(fieldId){
-";
-			echo "    var wrap = qs('#field_'+fid+'_'+fieldId);
-";
-			echo "    if(wrap){ wrap.style.display=''; wrap.setAttribute('data-conditional-logic','visible'); }
-";
-			echo "    var el = qs('#input_'+fid+'_'+fieldId);
-";
-			echo "    if(el){ el.disabled=false; }
-";
-			echo "  }
-";
-			echo "  function hideField(fieldId){
-";
-			echo "    var wrap = qs('#field_'+fid+'_'+fieldId);
-";
-			echo "    if(wrap){ wrap.style.display='none'; wrap.setAttribute('data-conditional-logic','hidden'); }
-";
-			echo "  }
-";
-			echo "  function applyPartner(){
-";
-			echo "    var map = (window.tcBfPartnerMap && window.tcBfPartnerMap[fid]) ? window.tcBfPartnerMap[fid] : {};
-";
-			echo "    var sel = qs('#input_'+fid+'_63');
-";
-			echo "    if(!sel) return;
-";
-			echo "    var code = (sel.value||'').toString().trim();
-";
-			echo "    var data = (code && map && map[code]) ? map[code] : null;
-";
-			echo "    if(!data){
-";
-			echo "      setVal(154,''); setVal(152,''); setVal(161,''); setVal(153,''); setVal(166,'');
-";
-			echo "      hideField(176); hideField(165);
-";
-			echo "    } else {
-";
-			echo "      setVal(154,code);
-";
-			echo "      setVal(152,(data.discount||''));
-";
-			echo "      setVal(161,(data.commission||''));
-";
-			echo "      setVal(153,(data.email||''));
-";
-			echo "      setVal(166,(data.id||''));
-";
-			echo "      showField(176); showField(165);
-";
-			echo "    }
-";
-			echo "    // Toggle breakdown in the HTML block (field 177)
-";
-			echo "    var summary = qs('#field_'+fid+'_177 .tc-bf-price-summary');
-";
-			echo "    if(summary){
-";
-			echo "      var ebPct = parseFloat((qs('#input_'+fid+'_172')||{}).value||0)||0;
-";
-			echo "      var ebLine = qs('.tc-bf-eb-line', summary);
-";
-			echo "      if(ebLine) ebLine.style.display = (ebPct>0) ? '' : 'none';
-";
-			echo "      var pLine = qs('.tc-bf-partner-line', summary);
-";
-			echo "      if(pLine) pLine.style.display = (data && code) ? '' : 'none';
-";
-			echo "      var commPct = parseFloat((qs('#input_'+fid+'_161')||{}).value||0)||0;
-";
-			echo "      var cLine = qs('.tc-bf-commission', summary);
-";
-			echo "      if(cLine) cLine.style.display = (commPct>0 && data && code) ? '' : 'none';
-";
-			echo "    }
-";
-			echo "    // Ask GF to recalc totals if available
-";
-			echo "    if(typeof window.gformCalculateTotalPrice === 'function'){
-";
-			echo "      try{ window.gformCalculateTotalPrice(fid); }catch(e){}
-";
-			echo "    }
-";
-			echo "  }
-";
-			echo "  function bind(){
-";
-			echo "    var sel = qs('#input_'+fid+'_63');
-";
-			echo "    if(!sel) return;
-";
-			echo "    if(sel.__tcBfBound) return;
-";
-			echo "    sel.__tcBfBound = true;
-";
-			echo "    sel.addEventListener('change', applyPartner);
-";
-			echo "    applyPartner();
-";
-			echo "  }
-";
-			echo "  // GF triggers gform_post_render in many setups; but we also bind on DOM ready.
-";
-			echo "  document.addEventListener('DOMContentLoaded', bind);
-";
-			echo "  if(window.gform && typeof window.gform.addAction === 'function'){
-";
-			echo "    try{ window.gform.addAction('gform_post_render', function(e, formId){ if(parseInt(formId,10)===fid){ bind(); } }); }catch(e){}
-";
-			echo "  }
-";
-			echo "  // Fallback: attempt bind shortly after load.
-";
-			echo "  setTimeout(bind, 400);
-";
-			echo "})();
-";
-			echo "</script>
-";
+			echo "\n<script id=\"tc-bf-partner-override-{$form_id}\">\n";
+			echo $js;
+			echo "\n</script>\n";
 		}
 	}
 
