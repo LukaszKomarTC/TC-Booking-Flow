@@ -106,6 +106,7 @@ final class Plugin {
 		add_filter('gform_pre_validation',         [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_filter('gform_pre_submission_filter',  [ $this, 'gf_partner_prepare_form' ], 10, 1);
 		add_action('wp_footer',                    [ $this, 'gf_output_partner_js' ], 100);
+		add_action('wp_footer',                    [ $this, 'gf_output_rental_price_js' ], 90);
 
 
 		// ---- GF: submission to cart (single source of truth)
@@ -956,7 +957,146 @@ public function gf_output_partner_js() : void {
 			}
 		}
 
-		return $form;
+		
+
+	/**
+	 * Frontend safety net for the "30,00 € → 3000,00 €" bug after conditional logic toggles (field 106).
+	 *
+	 * Why this exists even with server-side basePrice:
+	 * - Gravity Forms may rehydrate product price inputs with localized currency strings after show/hide,
+	 *   then later re-parse them as numbers, sometimes treating "30,00" as "3000".
+	 *
+	 * Strategy (minimal + safe):
+	 * - Do NOT recalc totals.
+	 * - Do NOT use MutationObservers.
+	 * - On gform_post_render + gform_post_conditional_logic, force the underlying product PRICE INPUT to a
+	 *   parse-safe numeric string (dot-decimal, no currency), while keeping the visible label formatted.
+	 *
+	 * Partner JS / ledger logic are untouched.
+	 */
+	public function gf_output_rental_price_js() : void {
+
+		$target_form_id = (int) \TC_BF\Admin\Settings::get_form_id();
+		if ( $target_form_id <= 0 ) return;
+		if ( ! is_singular('sc_event') ) return;
+
+		$event_id = (int) get_queried_object_id();
+		if ( $event_id <= 0 ) $event_id = (int) get_the_ID();
+		if ( $event_id <= 0 || get_post_type($event_id) !== 'sc_event' ) return;
+
+		// Only emit if at least one rental price is configured.
+		$prices = [
+			139 => $this->money_to_float( get_post_meta( $event_id, 'rental_price_road', true ) ),
+			140 => $this->money_to_float( get_post_meta( $event_id, 'rental_price_mtb', true ) ),
+			141 => $this->money_to_float( get_post_meta( $event_id, 'rental_price_ebike', true ) ),
+			171 => $this->money_to_float( get_post_meta( $event_id, 'rental_price_gravel', true ) ),
+		];
+
+		$has_any = false;
+		foreach ( $prices as $k => $v ) {
+			$v = (float) $v;
+			if ( $v > 0 ) { $has_any = true; break; }
+		}
+		if ( ! $has_any ) return;
+
+		// Normalize to numeric strings (dot-decimal) for parsing.
+		$norm = [];
+		foreach ( $prices as $fid => $v ) {
+			$v = (float) $v;
+			if ( $v < 0 ) $v = 0.0;
+			$norm[(string)$fid] = number_format( $v, 2, '.', '' );
+		}
+
+		$payload_json = wp_json_encode([
+			'formId' => $target_form_id,
+			'prices' => $norm,
+		]);
+
+		?>
+		<script>
+		(function(){
+			try {
+				var cfg = <?php echo $payload_json; ?>;
+				if(!cfg || !cfg.formId || !cfg.prices) return;
+
+				function dotToComma(s){
+					s = (s==null ? '' : String(s));
+					return s.replace('.', ',');
+				}
+
+				function ensureDisplay(formId, fieldId, formatted){
+					var fieldWrap = document.getElementById('field_' + formId + '_' + fieldId);
+					if(!fieldWrap) return;
+					// Common GF markup: span.ginput_product_price is the visible price label.
+					var spans = fieldWrap.querySelectorAll('.ginput_product_price');
+					for(var i=0;i<spans.length;i++){
+						var el = spans[i];
+						if(el && el.tagName && el.tagName.toUpperCase() !== 'INPUT'){
+							el.textContent = formatted;
+						}
+					}
+				}
+
+				function apply(formId){
+					// Only act if this form exists in DOM.
+					if(!document.getElementById('gform_' + formId) && !document.getElementById('gform_wrapper_' + formId)) return;
+
+					Object.keys(cfg.prices).forEach(function(fidStr){
+						var fieldId = parseInt(fidStr, 10);
+						if(!fieldId) return;
+						var dot = String(cfg.prices[fidStr] || '');
+						if(!dot) return;
+
+						// Prefer GF base price input id, fallback to name.
+						var inp = document.getElementById('ginput_base_price_' + formId + '_' + fieldId);
+						if(!inp){
+							inp = document.querySelector('input[name="input_' + fieldId + '.2"]');
+						}
+						if(!inp) return;
+
+						// Force parse-safe numeric.
+						inp.value = dot;
+
+						// If this input is visible (some GF configs show it), hide and provide a formatted display span.
+						try{
+							var isVisible = inp.offsetParent !== null && inp.type === 'text';
+							if(isVisible){
+								inp.style.display = 'none';
+								var existing = inp.parentNode ? inp.parentNode.querySelector('.tc-bf-price-display') : null;
+								if(!existing && inp.parentNode){
+									var sp = document.createElement('span');
+									sp.className = 'tc-bf-price-display';
+									sp.textContent = dotToComma(dot) + ' €';
+									inp.parentNode.insertBefore(sp, inp.nextSibling);
+								} else if(existing){
+									existing.textContent = dotToComma(dot) + ' €';
+								}
+							}
+						}catch(e){}
+
+						// Keep visible label formatted (comma + euro).
+						ensureDisplay(formId, fieldId, dotToComma(dot) + ' €');
+					});
+				}
+
+				// Initial + GF events
+				document.addEventListener('DOMContentLoaded', function(){ apply(cfg.formId); });
+
+				if(window.jQuery){
+					window.jQuery(document).on('gform_post_render', function(e, formId){
+						if(parseInt(formId,10) === parseInt(cfg.formId,10)) apply(cfg.formId);
+					});
+					window.jQuery(document).on('gform_post_conditional_logic', function(e, formId){
+						if(parseInt(formId,10) === parseInt(cfg.formId,10)) apply(cfg.formId);
+					});
+				}
+			} catch(err) {}
+		})();
+		</script>
+		<?php
+	}
+
+return $form;
 	}
 
 
