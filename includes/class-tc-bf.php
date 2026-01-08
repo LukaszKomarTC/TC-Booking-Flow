@@ -91,6 +91,12 @@ final class Plugin {
 		add_filter('gform_field_value_rental_price_ebike',  [ $this, 'gf_populate_rental_price_ebike' ]);
 		add_filter('gform_field_value_rental_price_gravel', [ $this, 'gf_populate_rental_price_gravel' ]);
 
+		// ---- GF: set rental PRODUCT base prices server-side (prevents 30,00 → 3000,00 on conditional toggles)
+		// Populate once at render-time; conditional logic should only show/hide.
+		add_filter('gform_pre_render',             [ $this, 'gf_rental_prepare_product_prices' ], 9, 1);
+		add_filter('gform_pre_validation',         [ $this, 'gf_rental_prepare_product_prices' ], 9, 1);
+		add_filter('gform_pre_submission_filter',  [ $this, 'gf_rental_prepare_product_prices' ], 9, 1);
+
 		// ---- GF: server-side validation (tamper-proof + self-heal)
 		add_filter('gform_validation', [ $this, 'gf_validation' ], 10, 1);
 
@@ -857,6 +863,95 @@ public function gf_output_partner_js() : void {
 		// Always return a clean numeric string without currency symbol.
 		return number_format( $amt, 2, '.', '' );
 	}
+
+	/**
+	 * Server-side (render-time) rental PRODUCT base price population.
+	 *
+	 * Why:
+	 * - The "3000,00 €" bug is triggered when Gravity Forms re-parses a localized currency string
+	 *   (e.g. "30,00 €") after conditional logic toggles (field 106: rental ↔ no rental ↔ rental).
+	 * - By setting the product field's basePrice in the GF form object BEFORE rendering, we avoid
+	 *   client-side re-population and keep conditional logic as show/hide only.
+	 *
+	 * Scope:
+	 * - Only on single sc_event pages
+	 * - Only on the active GF form (Admin Settings form ID)
+	 *
+	 * Safety:
+	 * - Does NOT touch partner JS or ledger logic.
+	 */
+	public function gf_rental_prepare_product_prices( $form ) {
+
+		$form_id = (int) ( is_array($form) && isset($form['id']) ? $form['id'] : 0 );
+		$target_form_id = (int) \TC_BF\Admin\Settings::get_form_id();
+		if ( $form_id <= 0 || $target_form_id <= 0 || $form_id !== $target_form_id ) return $form;
+
+		if ( ! is_singular('sc_event') ) return $form;
+
+		$event_id = (int) get_queried_object_id();
+		if ( $event_id <= 0 ) $event_id = (int) get_the_ID();
+		if ( $event_id <= 0 || get_post_type($event_id) !== 'sc_event' ) return $form;
+
+		// Read configured rental prices from event meta.
+		$prices = [
+			'road'   => $this->money_to_float( get_post_meta( $event_id, 'rental_price_road', true ) ),
+			'mtb'    => $this->money_to_float( get_post_meta( $event_id, 'rental_price_mtb', true ) ),
+			'ebike'  => $this->money_to_float( get_post_meta( $event_id, 'rental_price_ebike', true ) ),
+			'gravel' => $this->money_to_float( get_post_meta( $event_id, 'rental_price_gravel', true ) ),
+		];
+
+		// Normalize to floats >= 0.
+		foreach ( $prices as $k => $v ) {
+			$v = (float) $v;
+			if ( $v < 0 ) $v = 0.0;
+			$prices[$k] = $v;
+		}
+
+		if ( empty($form['fields']) || ! is_array($form['fields']) ) return $form;
+
+		foreach ( $form['fields'] as &$field ) {
+
+			// GF fields are objects.
+			if ( ! is_object($field) ) continue;
+
+			$type = isset($field->type) ? (string) $field->type : '';
+			if ( $type !== 'product' ) continue;
+
+			// Identify rental product fields by label/adminLabel/cssClass.
+			$hay = strtolower(
+				(string) ($field->label ?? '') . ' ' .
+				(string) ($field->adminLabel ?? '') . ' ' .
+				(string) ($field->cssClass ?? '')
+			);
+
+			// Must look like a bike rental line; avoid touching participation product.
+			if ( strpos($hay, 'alquiler') === false && strpos($hay, 'rental') === false ) continue;
+
+			$bucket = '';
+			if ( strpos($hay, 'emtb') !== false || strpos($hay, 'e-mtb') !== false || strpos($hay, 'e mtb') !== false || strpos($hay, 'ebike') !== false || strpos($hay, 'e-bike') !== false ) {
+				$bucket = 'ebike';
+			} elseif ( strpos($hay, 'gravel') !== false ) {
+				$bucket = 'gravel';
+			} elseif ( strpos($hay, 'road') !== false || strpos($hay, 'carretera') !== false ) {
+				$bucket = 'road';
+			} elseif ( strpos($hay, 'mtb') !== false || strpos($hay, 'btt') !== false ) {
+				$bucket = 'mtb';
+			}
+
+			if ( $bucket === '' ) continue;
+
+			$price = isset($prices[$bucket]) ? (float) $prices[$bucket] : 0.0;
+
+			// If no configured price, leave as-is (and the option will typically be hidden by your UI logic).
+			if ( $price <= 0 ) continue;
+
+			// Set base price in a parse-safe numeric format (dot decimal, no currency).
+			$field->basePrice = number_format( $price, 2, '.', '' );
+		}
+
+		return $form;
+	}
+
 
 	public function gf_validation( array $validation_result ) : array {
 		$form = isset($validation_result['form']) ? $validation_result['form'] : null;
