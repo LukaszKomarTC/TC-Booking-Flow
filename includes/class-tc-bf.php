@@ -420,7 +420,8 @@ private function cart_contains_entry_id( int $entry_id ) : bool {
 		$event_id = (int) get_queried_object_id();
 		$calc = $this->calculate_for_event($event_id);
 
-		return (string) wc_format_decimal((float) $calc['pct'], 2);
+		// IMPORTANT: return plain integer percent (e.g. "15"), not "15.00"
+    	return (string) ((int) round((float) ($calc['pct'] ?? 0)));
 	}
 
 	public function gf_validation( array $validation_result ) : array {
