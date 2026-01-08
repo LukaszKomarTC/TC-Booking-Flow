@@ -957,7 +957,8 @@ public function gf_output_partner_js() : void {
 			}
 		}
 
-		
+		return $form;
+	}
 
 	/**
 	 * Frontend safety net for the "30,00 € → 3000,00 €" bug after conditional logic toggles (field 106).
@@ -1095,11 +1096,7 @@ public function gf_output_partner_js() : void {
 		</script>
 		<?php
 	}
-
-return $form;
-	}
-
-
+	
 	public function gf_validation( array $validation_result ) : array {
 		$form = isset($validation_result['form']) ? $validation_result['form'] : null;
 		$form_id = (int) (is_array($form) && isset($form['id']) ? $form['id'] : 0);
