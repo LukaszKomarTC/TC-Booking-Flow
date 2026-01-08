@@ -84,6 +84,13 @@ final class Plugin {
 		// ---- GF: dynamic EB% population (field 172)
 		add_filter('gform_field_value_early_booking_discount_pct', [ $this, 'gf_populate_eb_pct' ]);
 
+		// ---- GF: dynamic rental price population (legacy parity; populate once, then only show/hide)
+		// IMPORTANT: return raw numeric only (no currency symbol). Gravity Forms will format for display.
+		add_filter('gform_field_value_rental_price_road',   [ $this, 'gf_populate_rental_price_road' ]);
+		add_filter('gform_field_value_rental_price_mtb',    [ $this, 'gf_populate_rental_price_mtb' ]);
+		add_filter('gform_field_value_rental_price_ebike',  [ $this, 'gf_populate_rental_price_ebike' ]);
+		add_filter('gform_field_value_rental_price_gravel', [ $this, 'gf_populate_rental_price_gravel' ]);
+
 		// ---- GF: server-side validation (tamper-proof + self-heal)
 		add_filter('gform_validation', [ $this, 'gf_validation' ], 10, 1);
 
@@ -802,6 +809,53 @@ public function gf_output_partner_js() : void {
 
 		// IMPORTANT: return plain integer percent (e.g. "15"), not "15.00"
     	return (string) ((int) round((float) ($calc['pct'] ?? 0)));
+	}
+
+	/**
+	 * Legacy parity: populate rental prices once via GF Dynamic Population.
+	 *
+	 * IMPORTANT:
+	 * - Return a raw numeric string ONLY (no currency symbol).
+	 * - Do not depend on field-106 change handlers.
+	 * - Conditional logic should only show/hide rental product fields.
+	 */
+	public function gf_populate_rental_price_road( $value ) {
+		return $this->gf_populate_rental_price_from_event_meta( 'rental_price_road', $value );
+	}
+	public function gf_populate_rental_price_mtb( $value ) {
+		return $this->gf_populate_rental_price_from_event_meta( 'rental_price_mtb', $value );
+	}
+	public function gf_populate_rental_price_ebike( $value ) {
+		return $this->gf_populate_rental_price_from_event_meta( 'rental_price_ebike', $value );
+	}
+	public function gf_populate_rental_price_gravel( $value ) {
+		return $this->gf_populate_rental_price_from_event_meta( 'rental_price_gravel', $value );
+	}
+
+	private function gf_populate_rental_price_from_event_meta( string $meta_key, $fallback_value ) {
+		// Only meaningful on single event pages.
+		if ( ! is_singular('sc_event') ) return $fallback_value;
+
+		$event_id = (int) get_queried_object_id();
+		if ( $event_id <= 0 ) $event_id = (int) get_the_ID();
+		if ( $event_id <= 0 || get_post_type( $event_id ) !== 'sc_event' ) return $fallback_value;
+
+		$raw = get_post_meta( $event_id, $meta_key, true );
+		if ( $raw === '' || $raw === null ) return '';
+
+		// Normalize to numeric (supports decimal_comma and currency strings). Output dot-decimal.
+		$amt = (float) $this->money_to_float( $raw );
+		if ( $amt <= 0 ) {
+			// Allow explicit zero if configured, otherwise empty.
+			$trim = trim( (string) $raw );
+			if ( $trim === '0' || $trim === '0,0' || $trim === '0,00' || $trim === '0.0' || $trim === '0.00' ) {
+				return '0.00';
+			}
+			return '';
+		}
+
+		// Always return a clean numeric string without currency symbol.
+		return number_format( $amt, 2, '.', '' );
 	}
 
 	public function gf_validation( array $validation_result ) : array {
