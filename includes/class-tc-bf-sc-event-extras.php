@@ -15,6 +15,19 @@ if ( ! defined('ABSPATH') ) exit;
  */
 final class Sc_Event_Extras {
 
+    /*
+     * NOTE (Stage 3 - GF decimal comma protection):
+     * Some GF Single Product base price inputs can be mis-parsed after conditional logic
+     * hide/show cycles when values are locale-formatted (e.g. "30,00 €").
+     * If GF treats comma as thousands separator, "30,00" becomes "3000,00" internally.
+     * The Stage 3 JS repair in output_sc_event_inline_js() caches intended base prices
+     * on first render and restores them after gform_post_conditional_logic when it detects
+     * a clear x100/x1000 multiplier jump.
+     *
+     * This is intentionally narrow: it repairs only the separator-misparse symptom without
+     * changing the business logic or the PHP ledger.
+     */
+
     const NONCE_KEY = 'tc_bf_sc_event_meta_nonce';
 
     public static function init() : void {
@@ -752,6 +765,115 @@ final class Sc_Event_Extras {
                 }, 50);
             }
 
+            /**
+             * Stage 3: Protect Single Product base prices from GF locale re-parse bugs after hide/show.
+             *
+             * Symptom: "30,00 €" becomes internally treated as "3000,00 €" after conditional logic toggles.
+             * Strategy:
+             *  - Cache the *intended* numeric value for each Single Product base price input at initial render.
+             *  - After GF conditional logic runs, compare current numeric to intended.
+             *  - If the current value is exactly 100x (or 1000x) the intended value, restore the intended display.
+             *
+             * This avoids touching pricing logic globally and only repairs obvious separator-misparse cases.
+             */
+            function tcBfParseMoneyToNumber(raw){
+                if (raw === null || raw === undefined) return 0;
+                var s = String(raw).trim();
+                if (!s) return 0;
+
+                // remove currency and NBSP
+                s = s.replace(/ /g, ' ').replace(/€/g,'').trim();
+
+                // keep digits, comma, dot, minus, spaces
+                s = s.replace(/[^\d,\.\-\s]/g,'');
+                s = s.replace(/\s+/g,'');
+
+                // If both "." and "," exist, assume "." thousands and "," decimal (1.234,56)
+                if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {
+                    s = s.replace(/\./g,'');
+                    s = s.replace(',', '.');
+                } else if (s.indexOf(',') !== -1) {
+                    // Only comma: treat as decimal
+                    s = s.replace(',', '.');
+                }
+                var n = parseFloat(s);
+                return isNaN(n) ? 0 : n;
+            }
+
+            function tcBfFormatEuroComma(n){
+                if (typeof n !== 'number' || isNaN(n)) n = 0;
+                // two decimals, comma decimal separator, dot thousands
+                var fixed = n.toFixed(2);
+                var parts = fixed.split('.');
+                var intPart = parts[0];
+                var decPart = parts[1] || '00';
+                // thousands grouping with dot
+                intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+                return intPart + ',' + decPart + ' €';
+            }
+
+            function tcBfGetSingleProductBasePriceInputs(){
+                // GF single product: id="ginput_base_price_{formId}_{fieldId}"
+                return $("#gform_"+fid+" input[id^='ginput_base_price_"+fid+"_']");
+            }
+
+            function tcBfCacheIntendedSingleProductPrices(){
+                tcBfGetSingleProductBasePriceInputs().each(function(){
+                    var $inp = $(this);
+                    if ($inp.data('tcIntended') !== undefined) return;
+                    var n = tcBfParseMoneyToNumber($inp.val());
+                    // store only meaningful positives
+                    if (n > 0) {
+                        $inp.data('tcIntended', n);
+                    }
+                });
+            }
+
+            function tcBfRepairSingleProductBasePrices(){
+                var changed = false;
+
+                tcBfGetSingleProductBasePriceInputs().each(function(){
+                    var $inp = $(this);
+                    var intended = $inp.data('tcIntended');
+                    if (intended === undefined || intended === null) return;
+
+                    var cur = tcBfParseMoneyToNumber($inp.val());
+                    if (!cur || !intended) return;
+
+                    // Detect common mis-parse multipliers (30,00 -> 3000,00 = x100)
+                    var ratio = cur / intended;
+
+                    // Allow small floating errors
+                    function near(a,b){ return Math.abs(a-b) < 0.0001; }
+
+                    if ( near(ratio, 100) || near(ratio, 1000) ) {
+                        var restored = tcBfFormatEuroComma(intended);
+                        if ($inp.val() !== restored) {
+                            $inp.val(restored);
+                            changed = true;
+                        }
+                    }
+                });
+
+                if (changed) {
+                    try {
+                        if (typeof window.gformCalculateTotalPrice === 'function') {
+                            window.gformCalculateTotalPrice(fid);
+                        }
+                    } catch(e) {}
+
+                    // If your booking-flow JS exposes a bike-field updater, call it too.
+                    try {
+                        if (typeof window.tcBfUpdateBikeFields === 'function') {
+                            window.tcBfUpdateBikeFields(fid);
+                        }
+                    } catch(e) {}
+                }
+            }
+
+            // Cache intended values early (initial correct render).
+            tcBfCacheIntendedSingleProductPrices();
+
             // Run once now (non-AJAX) and also after GF finishes rendering (AJAX-safe)
             tcBfApplyDriverFlags();
             tcBfScheduleRepair();
@@ -759,12 +881,17 @@ final class Sc_Event_Extras {
                 if (parseInt(formId,10) !== fid) return;
                 tcBfApplyDriverFlags();
                 tcBfScheduleRepair();
+                tcBfCacheIntendedSingleProductPrices();
             });
 
             // After GF conditional logic runs (covers section hide/show toggles)
             $(document).on('gform_post_conditional_logic', function(e, formId){
                 if (parseInt(formId,10) !== fid) return;
                 tcBfScheduleRepair();
+                // Let GF finish its internal re-parse first, then repair mis-parsed base prices.
+                window.setTimeout(function(){
+                    try { tcBfRepairSingleProductBasePrices(); } catch(e) {}
+                }, 60);
             });
 
             // Also schedule repair after any input changes inside the form
