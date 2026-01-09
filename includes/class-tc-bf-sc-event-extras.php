@@ -777,16 +777,16 @@ final class Sc_Event_Extras {
                 // If nothing selected, choose a sensible default:
                 // - category-driven default (rental_emtb etc.)
                 // - else if only one option remains after removals, select it
-                if (!$sel.val()) { $sel.prop('selectedIndex', 0).trigger('change');
-                    //if (!tcBfSelectByClass(defaultRentalClass)) {
-                       // var $realOpts = $sel.find('option').filter(function(){
-                         //   var v = $(this).val();
-                         //   return v && v !== '0';
-                      //  });
-                     //   if ($realOpts.length === 1) {
-                          //  $sel.val($realOpts.first().val()).trigger('change');
-                     //   }
-                   // }
+                if (!$sel.val()) {
+                    if (!tcBfSelectByClass(defaultRentalClass)) {
+                        var $realOpts = $sel.find('option').filter(function(){
+                            var v = $(this).val();
+                            return v && v !== '0';
+                        });
+                        if ($realOpts.length === 1) {
+                            $sel.val($realOpts.first().val()).trigger('change');
+                        }
+                    }
                 }
 
                 // Update bike fields now + on change
